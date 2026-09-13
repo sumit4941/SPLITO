@@ -10,19 +10,25 @@
     "node": ">=24.11.0 <25",
     "npm": ">=11.6.0"
   },
+  "overrides": {
+    "@vercel/routing-utils": {
+      "path-to-regexp": "6.3.0"
+    }
+  },
   "workspaces": [
     "apps/*",
     "packages/*"
   ],
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "build:vercel": "npm run build --workspace @splito/web",
+    "build:vercel": "node scripts/validate-vercel-env.mjs && npm run build --workspace @splito/web",
     "clean": "npm run clean --workspaces --if-present",
     "dev": "concurrently --kill-others-on-fail --names api,web,worker --prefix-colors violet,cyan,amber \"npm run dev --workspace @splito/api\" \"npm run dev --workspace @splito/web\" \"npm run dev --workspace @splito/worker\"",
     "dev:api": "npm run dev --workspace @splito/api",
     "dev:web": "npm run dev --workspace @splito/web",
     "dev:worker": "npm run dev --workspace @splito/worker",
     "typecheck": "npm run typecheck --workspaces --if-present",
+    "vercel:validate": "tsx scripts/validate-vercel-config.ts",
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
@@ -41,13 +47,14 @@
     "db:seed": "node --env-file-if-exists=.env database/seed/development.mjs",
     "db:reconcile": "node --env-file-if-exists=.env database/scripts/reconcile.mjs",
     "openapi:generate": "npm run generate --workspace @splito/api-client",
-    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run build"
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run vercel:validate && npm run test:coverage && npm run build"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@playwright/test": "1.63.0",
     "@types/node": "24.13.4",
     "@types/oracledb": "7.0.3",
+    "@vercel/config": "0.7.0",
     "@vitest/coverage-v8": "5.0.0",
     "concurrently": "10.0.5",
     "eslint": "10.10.0",

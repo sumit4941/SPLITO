@@ -34,10 +34,15 @@ CSRF cookie design. Keep `VITE_API_BASE_URL` unset in Vercel.
 
 ## Vercel project settings
 
-Import the repository at its root. The checked-in `vercel.mjs` selects Vite,
+Import the repository at its root. The checked-in `vercel.ts` selects Vite,
 runs `npm ci`, builds only `@splito/web`, publishes `apps/web/dist`, proxies API
 traffic before the SPA fallback, and applies the web security/cache headers.
 The root Node engine pins the build to Node 24.
+
+`vercel.ts` uses Vercel's `deploymentEnv()` and `routes.rewrite()` helpers. This
+keeps the rewrite destination present while marking `SPLITO_API_ORIGIN` for
+deployment-time substitution; do not replace it with an early `process.env`
+lookup in the route object.
 
 Set this non-secret environment variable for each enabled Vercel environment:
 
@@ -45,9 +50,10 @@ Set this non-secret environment variable for each enabled Vercel environment:
 SPLITO_API_ORIGIN=https://api.example.com
 ```
 
-It must be an HTTPS origin only: no `/api`, `/api/v1`, credentials, query, or
-fragment. The deployment fails closed when it is absent or malformed. Do not set
-`VITE_API_BASE_URL`; `/api/v1` must remain a same-origin browser path.
+It must be a canonical HTTPS origin only: no trailing slash, `/api`, `/api/v1`,
+credentials, query, or fragment. The build fails closed when it is absent or
+malformed. Do not set `VITE_API_BASE_URL`; `/api/v1` must remain a same-origin
+browser path.
 
 The API environment corresponding to the production web deployment must use:
 
@@ -75,8 +81,8 @@ Run locally before pushing the release commit:
 npm ci
 npm run verify
 $env:SPLITO_API_ORIGIN = 'https://api.example.com'
+npm run vercel:validate
 npm run build:vercel
-node -e "import('./vercel.mjs').then(({config}) => console.log(config.outputDirectory))"
 Remove-Item Env:SPLITO_API_ORIGIN
 ```
 

@@ -34,7 +34,13 @@ export default tseslint.config(
     },
   },
   {
-    files: ['**/*.config.{js,mjs,ts}', '**/*.test.ts', '**/*.spec.ts', 'scripts/**/*.ts'],
+    files: [
+      '**/*.config.{js,mjs,ts}',
+      '**/*.test.ts',
+      '**/*.spec.ts',
+      'scripts/**/*.ts',
+      'vercel.ts',
+    ],
     rules: {
       '@typescript-eslint/no-unsafe-assignment': 'off',
       '@typescript-eslint/no-unsafe-member-access': 'off',
@@ -57,6 +63,8 @@ export default tseslint.config(
       '**/*.spec.{ts,tsx}',
       'apps/web/e2e/**/*.ts',
       'apps/web/*.config.ts',
+      'scripts/**/*.ts',
+      'vercel.ts',
     ],
   },
   {
