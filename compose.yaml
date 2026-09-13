@@ -1,0 +1,116 @@
+name: splito
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      API_HOST: 0.0.0.0
+      API_PORT: 3000
+      WEB_ORIGIN: ${SPLITO_WEB_ORIGIN:?Set SPLITO_WEB_ORIGIN to the exact web origin}
+      TRUST_PROXY: 'true'
+      COOKIE_SECURE: '${COOKIE_SECURE:-true}'
+      DATABASE_CONNECT_STRING: ${DATABASE_CONNECT_STRING:?Set DATABASE_CONNECT_STRING to external Oracle FREEPDB1}
+      DATABASE_USER: ${DATABASE_USER:-SPLITO_APP}
+      DATABASE_OWNER_SCHEMA: ${DATABASE_OWNER_SCHEMA:-SPLITO_OWNER}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:?Set DATABASE_PASSWORD}
+      DATABASE_POOL_MIN: ${DATABASE_POOL_MIN:-1}
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-8}
+      DATABASE_POOL_INCREMENT: ${DATABASE_POOL_INCREMENT:-1}
+      DATABASE_QUEUE_TIMEOUT_MS: ${DATABASE_QUEUE_TIMEOUT_MS:-5000}
+      DATABASE_CALL_TIMEOUT_MS: ${DATABASE_CALL_TIMEOUT_MS:-15000}
+      SESSION_PEPPER: ${SESSION_PEPPER:?Set SESSION_PEPPER}
+      CSRF_SECRET: ${CSRF_SECRET:?Set CSRF_SECRET}
+      OTP_PEPPER: ${OTP_PEPPER:?Set OTP_PEPPER}
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:?Set MFA_ENCRYPTION_KEY}
+      SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-60}
+      SESSION_ABSOLUTE_HOURS: ${SESSION_ABSOLUTE_HOURS:-720}
+      ATTACHMENT_STORAGE_PATH: /var/lib/splito/private
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-10000000}
+      SMS_PROVIDER: ${SMS_PROVIDER:?Set SMS_PROVIDER to twilio after configuring spend and region controls}
+      SMS_REQUEST_TIMEOUT_MS: ${SMS_REQUEST_TIMEOUT_MS:-8000}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:?Set TWILIO_ACCOUNT_SID}
+      TWILIO_API_KEY_SID: ${TWILIO_API_KEY_SID:?Set TWILIO_API_KEY_SID}
+      TWILIO_API_KEY_SECRET: ${TWILIO_API_KEY_SECRET:?Set TWILIO_API_KEY_SECRET}
+      TWILIO_FROM_E164: ${TWILIO_FROM_E164:-}
+      TWILIO_MESSAGING_SERVICE_SID: ${TWILIO_MESSAGING_SERVICE_SID:-}
+    ports:
+      - '127.0.0.1:${SPLITO_API_PUBLIC_PORT:-3000}:3000'
+    volumes:
+      - splito-private-storage:/var/lib/splito/private
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+  worker:
+    profiles: ['worker']
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.worker
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_CONNECT_STRING: ${DATABASE_CONNECT_STRING:?Set DATABASE_CONNECT_STRING to external Oracle FREEPDB1}
+      DATABASE_USER: ${DATABASE_USER:-SPLITO_APP}
+      DATABASE_OWNER_SCHEMA: ${DATABASE_OWNER_SCHEMA:-SPLITO_OWNER}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:?Set DATABASE_PASSWORD}
+      DATABASE_POOL_MIN: ${DATABASE_POOL_MIN:-1}
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-8}
+      DATABASE_POOL_INCREMENT: ${DATABASE_POOL_INCREMENT:-1}
+      DATABASE_QUEUE_TIMEOUT_MS: ${DATABASE_QUEUE_TIMEOUT_MS:-5000}
+      DATABASE_CALL_TIMEOUT_MS: ${DATABASE_CALL_TIMEOUT_MS:-15000}
+      OUTBOX_POLL_MS: ${OUTBOX_POLL_MS:-1000}
+      OUTBOX_LEASE_SECONDS: ${OUTBOX_LEASE_SECONDS:-60}
+      OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-10}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:${SPLITO_WEB_PUBLIC_PORT:-8080}:8080'
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /var/cache/nginx:size=32m,mode=0755
+    security_opt:
+      - no-new-privileges:true
+
+  migrate:
+    profiles: ['tools']
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.api
+    environment:
+      SPLITO_MIGRATION_DB_CONNECT_STRING: ${SPLITO_MIGRATION_DB_CONNECT_STRING:?Set migration connect string}
+      SPLITO_MIGRATION_DB_USER: ${SPLITO_MIGRATION_DB_USER:-SPLITO_OWNER}
+      SPLITO_MIGRATION_DB_PASSWORD: ${SPLITO_MIGRATION_DB_PASSWORD:?Set migration password}
+      SPLITO_MIGRATION_LOCK_TIMEOUT_SECONDS: ${SPLITO_MIGRATION_LOCK_TIMEOUT_SECONDS:-60}
+      SPLITO_MIGRATION_LEASE_SECONDS: ${SPLITO_MIGRATION_LEASE_SECONDS:-600}
+      SPLITO_MIGRATION_CALL_TIMEOUT_MS: ${SPLITO_MIGRATION_CALL_TIMEOUT_MS:-120000}
+      SPLITO_ORACLE_MODE: thin
+    command: ['node', 'database/scripts/migrate.mjs']
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  splito-private-storage:

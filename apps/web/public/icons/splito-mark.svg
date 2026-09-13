@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">SPLITO shared money mark</title>
+  <defs>
+    <linearGradient id="v" x1="7" x2="57" y1="7" y2="56" gradientUnits="userSpaceOnUse"><stop stop-color="#957BFF"/><stop offset="1" stop-color="#5B37E4"/></linearGradient>
+    <linearGradient id="c" x1="15" x2="55" y1="55" y2="9" gradientUnits="userSpaceOnUse"><stop stop-color="#12B7D5"/><stop offset="1" stop-color="#66E4EF"/></linearGradient>
+    <linearGradient id="w" x1="7" x2="52" y1="53" y2="9" gradientUnits="userSpaceOnUse"><stop stop-color="#FB7185"/><stop offset="1" stop-color="#F7B84B"/></linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="#111A31"/>
+  <path d="M32 7a25 25 0 0 1 24.2 18.5L46 28.2A14.4 14.4 0 0 0 32 17.5V7Z" fill="url(#v)"/>
+  <path d="M57 32a25 25 0 0 1-18.5 24.2L35.8 46A14.4 14.4 0 0 0 46.5 32H57Z" fill="url(#c)"/>
+  <path d="M32 57A25 25 0 0 1 7.8 38.5L18 35.8A14.4 14.4 0 0 0 32 46.5V57Z" fill="url(#w)"/>
+  <path d="M7 32A25 25 0 0 1 25.5 7.8L28.2 18A14.4 14.4 0 0 0 17.5 32H7Z" fill="#25C78A"/>
+  <circle cx="32" cy="32" r="8.5" fill="#111A31"/>
+  <path d="M29 28.5h6M29 32h6M29 35.5h3.8" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
+</svg>

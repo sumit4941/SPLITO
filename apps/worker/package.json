@@ -1,0 +1,26 @@
+{
+  "name": "@splito/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "predev": "npm run build --workspace @splito/config",
+    "dev": "node --env-file-if-exists=../../.env --import tsx --watch src/main.ts",
+    "start": "node --env-file-if-exists=../../.env dist/main.js",
+    "prebuild": "npm run build --workspace @splito/config",
+    "build": "tsc -p tsconfig.json",
+    "pretypecheck": "npm run build --workspace @splito/config",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "pretest": "npm run build --workspace @splito/config",
+    "test": "vitest run src/outbox-worker.test.ts",
+    "pretest:integration": "npm run build --workspace @splito/config",
+    "test:integration": "node --env-file-if-exists=../../.env ../../node_modules/vitest/vitest.mjs run --config src/vitest.oracle.config.ts",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@splito/config": "0.1.0",
+    "oracledb": "7.0.1",
+    "pino": "10.3.1"
+  }
+}

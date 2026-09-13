@@ -1,0 +1,61 @@
+{
+  "name": "@splito/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "npm run build --workspace @splito/api-client",
+    "dev": "vite",
+    "prebuild": "npm run build --workspace @splito/api-client",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "pretest": "npm run build --workspace @splito/api-client",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "pretypecheck": "npm run build --workspace @splito/api-client",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "dependencies": {
+    "@hookform/resolvers": "5.9.1",
+    "@radix-ui/react-dialog": "1.1.23",
+    "@radix-ui/react-slot": "1.3.3",
+    "@splito/api-client": "0.1.0",
+    "@splito/ui": "0.1.0",
+    "@tanstack/react-query": "5.102.8",
+    "dexie": "4.4.6",
+    "i18next": "26.4.2",
+    "lucide-react": "1.45.0",
+    "motion": "13.2.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-hook-form": "7.88.0",
+    "react-i18next": "17.0.13",
+    "react-router-dom": "7.18.3",
+    "recharts": "3.10.1",
+    "zod": "4.6.2"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.63.0",
+    "@tailwindcss/vite": "4.3.3",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.7",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "ajv": "8.20.0",
+    "ajv-errors": "3.0.0",
+    "ajv-formats": "2.1.1",
+    "jsdom": "29.1.1",
+    "tailwindcss": "4.3.3",
+    "typescript": "6.0.3",
+    "vite": "8.3.0",
+    "vite-plugin-pwa": "1.3.0",
+    "vitest": "5.0.0"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

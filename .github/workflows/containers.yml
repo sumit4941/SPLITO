@@ -1,0 +1,58 @@
+name: Container validation
+
+on:
+  pull_request:
+    paths:
+      - 'apps/**'
+      - 'packages/**'
+      - 'database/**'
+      - 'deploy/**'
+      - 'compose.yaml'
+      - '.dockerignore'
+      - 'package*.json'
+      - '.github/workflows/containers.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: containers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      # Synthetic values validate interpolation only; containers do not connect.
+      NODE_ENV: production
+      SPLITO_WEB_ORIGIN: https://splito.example.test
+      COOKIE_SECURE: 'true'
+      DATABASE_CONNECT_STRING: oracle.example.test:1522/SPLITOPDB
+      DATABASE_USER: SPLITO_APP
+      DATABASE_OWNER_SCHEMA: SPLITO_OWNER
+      DATABASE_PASSWORD: ci-container-database-only # gitleaks:allow
+      SESSION_PEPPER: ssssssssssssssssssssssssssssssss # gitleaks:allow
+      CSRF_SECRET: cccccccccccccccccccccccccccccccc # gitleaks:allow
+      MFA_ENCRYPTION_KEY: '0000000000000000000000000000000000000000000000000000000000000001' # gitleaks:allow
+      SPLITO_MIGRATION_DB_CONNECT_STRING: oracle.example.test:1522/SPLITOPDB
+      SPLITO_MIGRATION_DB_USER: SPLITO_OWNER
+      SPLITO_MIGRATION_DB_PASSWORD: ci-container-migration-only # gitleaks:allow
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Validate Compose model
+        run: docker compose config --quiet
+      - name: Build application images
+        run: |
+          docker build --file deploy/docker/Dockerfile.api --tag splito-api:ci .
+          docker build --file deploy/docker/Dockerfile.worker --tag splito-worker:ci .
+          docker build --file deploy/docker/Dockerfile.web --tag splito-web:ci .
+      - name: Verify runtime artifacts and nginx configuration
+        run: |
+          docker run --rm --entrypoint node splito-api:ci --check apps/api/dist/main.js
+          docker run --rm --entrypoint node splito-worker:ci --check apps/worker/dist/main.js
+          docker run --rm --add-host api:127.0.0.1 --entrypoint nginx splito-web:ci -t

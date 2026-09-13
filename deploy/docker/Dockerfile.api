@@ -1,0 +1,35 @@
+FROM node:24.21.0-bookworm-slim AS build
+WORKDIR /workspace
+ENV NODE_ENV=development
+COPY package.json package-lock.json ./
+COPY apps/api/package.json apps/api/package.json
+COPY apps/worker/package.json apps/worker/package.json
+COPY apps/web/package.json apps/web/package.json
+COPY packages/api-client/package.json packages/api-client/package.json
+COPY packages/config/package.json packages/config/package.json
+COPY packages/domain/package.json packages/domain/package.json
+COPY packages/ui/package.json packages/ui/package.json
+RUN npm ci
+COPY . .
+RUN npm run build --workspace @splito/config \
+ && npm run build --workspace @splito/domain \
+ && npm run build --workspace @splito/api \
+ && npm prune --omit=dev
+
+FROM node:24.21.0-bookworm-slim AS runtime
+WORKDIR /workspace
+ENV NODE_ENV=production \
+    API_HOST=0.0.0.0
+COPY --from=build --chown=node:node /workspace/package.json /workspace/package-lock.json ./
+COPY --from=build --chown=node:node /workspace/node_modules ./node_modules
+COPY --from=build --chown=node:node /workspace/apps/api ./apps/api
+COPY --from=build --chown=node:node /workspace/packages/config ./packages/config
+COPY --from=build --chown=node:node /workspace/packages/domain ./packages/domain
+COPY --from=build --chown=node:node /workspace/database ./database
+RUN mkdir -p /var/lib/splito/private \
+ && chown -R node:node /var/lib/splito
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.API_PORT||3000)+'/api/v1/health/live').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+CMD ["node", "apps/api/dist/main.js"]

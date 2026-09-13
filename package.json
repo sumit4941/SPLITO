@@ -1,0 +1,62 @@
+{
+  "name": "splito",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SPLITO — API-first expense sharing for groups, friends, and households",
+  "license": "UNLICENSED",
+  "type": "module",
+  "packageManager": "npm@11.6.2",
+  "engines": {
+    "node": ">=24.11.0 <25",
+    "npm": ">=11.6.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:vercel": "npm run build --workspace @splito/web",
+    "clean": "npm run clean --workspaces --if-present",
+    "dev": "concurrently --kill-others-on-fail --names api,web,worker --prefix-colors violet,cyan,amber \"npm run dev --workspace @splito/api\" \"npm run dev --workspace @splito/web\" \"npm run dev --workspace @splito/worker\"",
+    "dev:api": "npm run dev --workspace @splito/api",
+    "dev:web": "npm run dev --workspace @splito/web",
+    "dev:worker": "npm run dev --workspace @splito/worker",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint . --max-warnings=0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "pretest": "npm run build --workspace @splito/config && npm run build --workspace @splito/domain && npm run build --workspace @splito/api-client",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "smoke:api": "node --env-file-if-exists=.env scripts/smoke-api.mjs",
+    "smoke:group-invitations": "node --env-file-if-exists=.env scripts/smoke-group-invitations.mjs",
+    "db:bootstrap": "node --env-file-if-exists=.env database/admin/bootstrap-users.mjs",
+    "db:migrate": "node --env-file-if-exists=.env database/scripts/migrate.mjs",
+    "db:status": "node --env-file-if-exists=.env database/scripts/validate-schema.mjs",
+    "db:verify": "node --env-file-if-exists=.env database/scripts/verify-connection.mjs",
+    "db:check-prefix": "node --env-file-if-exists=.env database/scripts/check-prefix.mjs",
+    "db:seed": "node --env-file-if-exists=.env database/seed/development.mjs",
+    "db:reconcile": "node --env-file-if-exists=.env database/scripts/reconcile.mjs",
+    "openapi:generate": "npm run generate --workspace @splito/api-client",
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.63.0",
+    "@types/node": "24.13.4",
+    "@types/oracledb": "7.0.3",
+    "@vitest/coverage-v8": "5.0.0",
+    "concurrently": "10.0.5",
+    "eslint": "10.10.0",
+    "fast-check": "4.10.0",
+    "globals": "17.12.0",
+    "prettier": "3.9.6",
+    "tsx": "4.23.13",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.0",
+    "vitest": "5.0.0"
+  }
+}
