@@ -4,7 +4,7 @@ import type { Environment } from '@splito/config';
 import { argon2id, hash as argonHash, verify as argonVerify } from 'argon2';
 import { ApiError } from '../common/api-error.js';
 import { APP_CONFIG } from '../config/app-config.js';
-import { OracleService } from '../database/oracle.service.js';
+import { isMongoDuplicateKey, MongoService } from '../database/mongo.service.js';
 import { SmsDeliveryService } from '../sms/sms-delivery.service.js';
 import {
   generateNumericOtp,
@@ -39,12 +39,6 @@ export const MOBILE_OTP_POLICY = {
   maxAttempts: 5,
 } as const;
 
-function oracleErrorNumber(error: unknown): number | undefined {
-  return typeof error === 'object' && error !== null && 'errorNum' in error
-    ? Number(error.errorNum)
-    : undefined;
-}
-
 @Injectable()
 export class AuthService {
   readonly #sessionPepper: string;
@@ -53,7 +47,7 @@ export class AuthService {
 
   constructor(
     private readonly repository: AuthRepository,
-    private readonly oracle: OracleService,
+    private readonly mongo: MongoService,
     @Inject(APP_CONFIG) private readonly config: Environment,
     private readonly sms: SmsDeliveryService,
   ) {
@@ -76,8 +70,8 @@ export class AuthService {
     const verificationToken = generateOpaqueToken();
     const passwordHash = await argonHash(input.password, PASSWORD_OPTIONS);
     try {
-      await this.oracle.withTransaction((connection) =>
-        this.repository.createPendingAccount(connection, {
+      await this.mongo.withTransaction((work) =>
+        this.repository.createPendingAccount(work, {
           ...input,
           userId,
           participantId,
@@ -90,7 +84,7 @@ export class AuthService {
         }),
       );
     } catch (error) {
-      if (oracleErrorNumber(error) === 1) {
+      if (isMongoDuplicateKey(error)) {
         // Registration responses deliberately avoid becoming a public account directory.
         return { verificationRequired: true };
       }
@@ -107,8 +101,8 @@ export class AuthService {
   }
 
   async verifyEmail(token: string): Promise<void> {
-    const consumed = await this.oracle.withTransaction((connection) =>
-      this.repository.consumeVerificationToken(connection, sha256(token)),
+    const consumed = await this.mongo.withTransaction((work) =>
+      this.repository.consumeVerificationToken(work, sha256(token)),
     );
     if (!consumed) {
       throw new ApiError(
@@ -142,8 +136,8 @@ export class AuthService {
     const csrfToken = generateOpaqueToken();
     const csrfHash = secretHash(this.#csrfSecret, csrfToken);
     const expiresAt = new Date(Date.now() + this.config.SESSION_ABSOLUTE_HOURS * 60 * 60 * 1_000);
-    await this.oracle.withTransaction((connection) =>
-      this.repository.rotateSession(connection, {
+    await this.mongo.withTransaction((work) =>
+      this.repository.rotateSession(work, {
         sessionId,
         userId: row.USER_ID,
         tokenHash: secretHash(this.#sessionPepper, sessionToken),
@@ -156,7 +150,14 @@ export class AuthService {
     );
 
     return {
-      auth: { sessionId, user: rowToAuthenticatedUser(row), csrfHash },
+      auth: {
+        sessionId,
+        user: rowToAuthenticatedUser({
+          ...row,
+          VERSION_NO: String(Number(row.VERSION_NO) + 1),
+        }),
+        csrfHash,
+      },
       sessionToken,
       csrfToken,
       expiresAt,
@@ -180,8 +181,8 @@ export class AuthService {
     const ipHash = this.ipAddressHash(request.ip);
     let issueResult: Awaited<ReturnType<AuthRepository['issueMobileOtp']>>;
     try {
-      issueResult = await this.oracle.withTransaction((connection) =>
-        this.repository.issueMobileOtp(connection, {
+      issueResult = await this.mongo.withTransaction((work) =>
+        this.repository.issueMobileOtp(work, {
           challengeId,
           mobileNumber: input.mobileNumber,
           otpHash: mobileOtpHash(this.#otpPepper, challengeId, input.mobileNumber, otp),
@@ -203,7 +204,7 @@ export class AuthService {
         }),
       );
     } catch (error) {
-      if (oracleErrorNumber(error) === 1) {
+      if (isMongoDuplicateKey(error)) {
         throw new ApiError(
           429,
           'OTP_RATE_LIMITED',
@@ -253,9 +254,9 @@ export class AuthService {
     const csrfToken = generateOpaqueToken();
     const csrfHash = secretHash(this.#csrfSecret, csrfToken);
     const expiresAt = new Date(Date.now() + this.config.SESSION_ABSOLUTE_HOURS * 60 * 60 * 1_000);
-    const result = await this.oracle.withTransaction(async (connection) => {
+    const result = await this.mongo.withTransaction(async (work) => {
       const challenge = await this.repository.lockMobileOtpChallenge(
-        connection,
+        work,
         input.challengeId,
         input.mobileNumber,
       );
@@ -264,7 +265,7 @@ export class AuthService {
         challenge.EXPIRED_FLAG === 'Y' ||
         Number(challenge.ATTEMPT_COUNT) >= Number(challenge.MAX_ATTEMPTS)
       ) {
-        await this.repository.expireMobileOtp(connection, challenge.OTP_CHALLENGE_ID);
+        await this.repository.expireMobileOtp(work, challenge.OTP_CHALLENGE_ID);
         return { outcome: 'invalid' } as const;
       }
 
@@ -275,11 +276,11 @@ export class AuthService {
         input.otp,
       );
       if (!hashesEqual(challenge.OTP_HASH, expectedHash)) {
-        await this.repository.recordFailedMobileOtpAttempt(connection, challenge.OTP_CHALLENGE_ID);
+        await this.repository.recordFailedMobileOtpAttempt(work, challenge.OTP_CHALLENGE_ID);
         return { outcome: 'invalid' } as const;
       }
 
-      return this.repository.authenticateMobileOtp(connection, {
+      return this.repository.authenticateMobileOtp(work, {
         challengeId: challenge.OTP_CHALLENGE_ID,
         mobileNumber: input.mobileNumber,
         newUserId: randomUUID(),

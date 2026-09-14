@@ -1,6 +1,5 @@
-import type { Connection } from 'oracledb';
 import { describe, expect, it, vi } from 'vitest';
-import type { OracleService } from '../database/oracle.service.js';
+import { COLLECTIONS, type MongoService, type MongoUnitOfWork } from '../database/mongo.service.js';
 import { GroupInvitationsRepository, type ManagedGroup } from './group-invitations.repository.js';
 
 const groupId = '11111111-1111-4111-8111-111111111111';
@@ -12,8 +11,6 @@ const inviterParticipantId = '66666666-6666-4666-8666-666666666666';
 const mobileNumber = '+14155550123';
 const tokenHash = Buffer.alloc(32, 7);
 
-const raw = (value: string) => Buffer.from(value.replaceAll('-', ''), 'hex');
-
 const group: ManagedGroup = {
   groupId,
   contextId,
@@ -22,179 +19,337 @@ const group: ManagedGroup = {
   callerRole: 'OWNER',
 };
 
-describe('Oracle group invitation persistence', () => {
-  it('previews only a live pending token bound to the exact authenticated mobile', async () => {
-    const execute = vi.fn().mockResolvedValue({
-      rows: [
-        {
-          INVITATION_ID: raw(invitationId),
-          CONTEXT_ID: raw(contextId),
-          GROUP_ID: raw(groupId),
-          GROUP_NAME: group.groupName,
-          INVITER_DISPLAY_NAME: 'Alex',
-          EXPIRES_AT_TEXT: '2030-01-01T00:00:00.000000Z',
-        },
-      ],
-    });
-    const repository = new GroupInvitationsRepository({ execute } as unknown as OracleService);
+function createWork(collections: Record<string, unknown>): MongoUnitOfWork {
+  return {
+    db: { collection: vi.fn((name: string) => collections[name]) },
+  } as unknown as MongoUnitOfWork;
+}
 
-    await expect(repository.preview({} as Connection, tokenHash, mobileNumber)).resolves.toEqual({
+function invitation(status: 'PENDING' | 'ACCEPTED' = 'PENDING') {
+  return {
+    _id: invitationId,
+    invitationType: 'GROUP' as const,
+    contextId,
+    inviterParticipantId,
+    inviteeMobileE164: mobileNumber,
+    ...(status === 'ACCEPTED' ? { inviteeParticipantId: actorParticipantId } : {}),
+    tokenHash,
+    status,
+    expiresAt: new Date('2030-01-01T00:00:00Z'),
+    resendCount: 0,
+    createdAt: new Date('2026-01-01T00:00:00Z'),
+    updatedAt: new Date('2026-01-01T00:00:00Z'),
+  };
+}
+
+describe('Mongo group invitation persistence', () => {
+  it('previews only a live pending token bound to the exact authenticated mobile', async () => {
+    const invitations = { findOne: vi.fn().mockResolvedValue(invitation()) };
+    const contexts = {
+      findOne: vi.fn().mockResolvedValue({ _id: contextId, status: 'ACTIVE', mutationVersion: 1 }),
+    };
+    const groups = {
+      findOne: vi.fn().mockResolvedValue({ _id: groupId, contextId, name: group.groupName }),
+    };
+    const members = {
+      findOne: vi.fn().mockResolvedValue({
+        contextId,
+        participantId: inviterParticipantId,
+        status: 'ACTIVE',
+        role: 'OWNER',
+      }),
+    };
+    const participants = {
+      findOne: vi.fn().mockResolvedValue({
+        _id: inviterParticipantId,
+        displayName: 'Alex',
+        kind: 'USER',
+      }),
+    };
+    const repository = new GroupInvitationsRepository({} as MongoService);
+
+    await expect(
+      repository.preview(
+        createWork({
+          [COLLECTIONS.invitations]: invitations,
+          [COLLECTIONS.contexts]: contexts,
+          [COLLECTIONS.groups]: groups,
+          [COLLECTIONS.contextMembers]: members,
+          [COLLECTIONS.participants]: participants,
+        }),
+        tokenHash,
+        mobileNumber,
+      ),
+    ).resolves.toEqual({
       invitationId,
       groupId,
       groupName: group.groupName,
       inviterDisplayName: 'Alex',
-      expiresAt: '2030-01-01T00:00:00.000000Z',
+      expiresAt: '2030-01-01T00:00:00.000Z',
     });
-
-    const sql = String(execute.mock.calls[0]?.[1]);
-    expect(sql).toContain('I.TOKEN_HASH = :tokenHash');
-    expect(sql).toContain('I.INVITEE_MOBILE_E164 = :mobileNumber');
-    expect(sql).toContain("I.STATUS = 'PENDING'");
-    expect(sql).toContain('I.EXPIRES_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)');
-    expect(sql).toContain("INVITER_M.MEMBER_ROLE IN ('OWNER', 'ADMIN')");
-    expect(execute.mock.calls[0]?.[2]).toEqual({ tokenHash, mobileNumber });
+    expect(invitations.findOne).toHaveBeenCalledWith(
+      {
+        invitationType: 'GROUP',
+        tokenHash,
+        inviteeMobileE164: mobileNumber,
+        status: 'PENDING',
+        expiresAt: { $gt: expect.any(Date) },
+      },
+      expect.anything(),
+    );
+    expect(members.findOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        participantId: inviterParticipantId,
+        status: 'ACTIVE',
+        role: { $in: ['OWNER', 'ADMIN'] },
+      }),
+      expect.anything(),
+    );
   });
 
-  it('keeps phone and token material out of invitation outbox and audit JSON', async () => {
-    const execute = vi
-      .fn()
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rowsAffected: 1 })
-      .mockResolvedValueOnce({ rowsAffected: 1 })
-      .mockResolvedValueOnce({ rowsAffected: 1 });
-    const repository = new GroupInvitationsRepository({ execute } as unknown as OracleService);
+  it('keeps phone and token material out of invitation outbox and audit documents', async () => {
+    const contexts = { updateOne: vi.fn().mockResolvedValue({ matchedCount: 1 }) };
+    const invitations = {
+      findOne: vi.fn().mockResolvedValue(null),
+      insertOne: vi.fn().mockResolvedValue({ acknowledged: true }),
+    };
+    const outbox = { insertOne: vi.fn().mockResolvedValue({ acknowledged: true }) };
+    const audit = { insertOne: vi.fn().mockResolvedValue({ acknowledged: true }) };
+    const repository = new GroupInvitationsRepository({} as MongoService);
 
-    await repository.issueInvitation({} as Connection, {
-      group,
-      mobileNumber,
-      tokenHash,
-      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
-      actorParticipantId,
-      actorUserId,
-      requestId: 'request-invite',
-    });
-
-    const insertBinds = execute.mock.calls[1]?.[2] as Record<string, unknown>;
-    expect(insertBinds).toMatchObject({ mobileNumber, tokenHash });
-    const outboxJson = String((execute.mock.calls[2]?.[2] as Record<string, unknown>).payload);
-    const auditJson = String((execute.mock.calls[3]?.[2] as Record<string, unknown>).metadata);
-    expect(outboxJson).not.toContain(mobileNumber);
-    expect(outboxJson).not.toContain(tokenHash.toString('hex'));
-    expect(auditJson).not.toContain(mobileNumber);
-    expect(auditJson).not.toContain(tokenHash.toString('hex'));
-    expect(JSON.parse(outboxJson)).toEqual(
-      expect.objectContaining({ groupId, invitationId: expect.any(String) }),
+    const result = await repository.issueInvitation(
+      createWork({
+        [COLLECTIONS.contexts]: contexts,
+        [COLLECTIONS.invitations]: invitations,
+        [COLLECTIONS.outbox]: outbox,
+        [COLLECTIONS.auditEvents]: audit,
+      }),
+      {
+        group,
+        mobileNumber,
+        tokenHash,
+        expiresAt: new Date('2030-01-01T00:00:00Z'),
+        actorParticipantId,
+        actorUserId,
+        requestId: 'request-invite',
+      },
     );
-    expect(JSON.parse(auditJson)).toEqual({ deliveryChannel: 'sms' });
+
+    expect(result).toMatchObject({ invitationId: expect.any(String), resend: false });
+    expect(contexts.updateOne).toHaveBeenCalledWith(
+      { _id: contextId, status: 'ACTIVE' },
+      expect.objectContaining({ $inc: { mutationVersion: 1 } }),
+      expect.anything(),
+    );
+    expect(invitations.insertOne).toHaveBeenCalledWith(
+      expect.objectContaining({ inviteeMobileE164: mobileNumber, tokenHash }),
+      expect.anything(),
+    );
+    const outboxDocument = outbox.insertOne.mock.calls[0]?.[0];
+    const auditDocument = audit.insertOne.mock.calls[0]?.[0];
+    expect(JSON.stringify(outboxDocument)).not.toContain(mobileNumber);
+    expect(JSON.stringify(outboxDocument)).not.toContain(tokenHash.toString('hex'));
+    expect(JSON.stringify(auditDocument)).not.toContain(mobileNumber);
+    expect(JSON.stringify(auditDocument)).not.toContain(tokenHash.toString('hex'));
+    expect(outboxDocument).toMatchObject({
+      eventType: 'group.invitation.requested',
+      payload: { invitationId: expect.any(String), groupId },
+    });
+    expect(auditDocument).toMatchObject({ metadata: { deliveryChannel: 'sms' } });
+  });
+
+  it('renews an expired pending slot in place without reusing its unique key', async () => {
+    const contexts = { updateOne: vi.fn().mockResolvedValue({ matchedCount: 1 }) };
+    const invitations = {
+      findOne: vi
+        .fn()
+        .mockResolvedValue({ ...invitation(), expiresAt: new Date('2020-01-01T00:00:00Z') }),
+      updateOne: vi.fn().mockResolvedValue({ modifiedCount: 1 }),
+      insertOne: vi.fn(),
+    };
+    const outbox = { insertOne: vi.fn().mockResolvedValue({ acknowledged: true }) };
+    const audit = { insertOne: vi.fn().mockResolvedValue({ acknowledged: true }) };
+    const repository = new GroupInvitationsRepository({} as MongoService);
+
+    await expect(
+      repository.issueInvitation(
+        createWork({
+          [COLLECTIONS.contexts]: contexts,
+          [COLLECTIONS.invitations]: invitations,
+          [COLLECTIONS.outbox]: outbox,
+          [COLLECTIONS.auditEvents]: audit,
+        }),
+        {
+          group,
+          mobileNumber,
+          tokenHash: Buffer.alloc(32, 8),
+          expiresAt: new Date('2031-01-01T00:00:00Z'),
+          actorParticipantId,
+          actorUserId,
+          requestId: 'request-renew',
+        },
+      ),
+    ).resolves.toEqual({ invitationId, resend: false });
+
+    expect(invitations.updateOne).toHaveBeenCalledWith(
+      { _id: invitationId, status: 'PENDING' },
+      expect.objectContaining({
+        $set: expect.objectContaining({ status: 'PENDING', resendCount: 0 }),
+        $unset: { respondedAt: '', revokedAt: '' },
+      }),
+      expect.anything(),
+    );
+    expect(invitations.insertOne).not.toHaveBeenCalled();
+    expect(audit.insertOne).toHaveBeenCalledWith(
+      expect.objectContaining({ actionKey: 'group.invitation.create' }),
+      expect.anything(),
+    );
   });
 
   it('returns a same-phone accepted replay without duplicating membership or events', async () => {
-    const execute = vi
-      .fn()
-      .mockResolvedValueOnce({ rows: [{ CONTEXT_ID: raw(contextId) }] })
-      .mockResolvedValueOnce({
-        rows: [
-          {
-            INVITATION_ID: raw(invitationId),
-            CONTEXT_ID: raw(contextId),
-            INVITER_PARTICIPANT_ID: raw(inviterParticipantId),
-            INVITEE_PARTICIPANT_ID: raw(actorParticipantId),
-            STATUS: 'ACCEPTED',
-            GROUP_ID: raw(groupId),
-            GROUP_NAME: group.groupName,
-            INVITER_DISPLAY_NAME: 'Alex',
-            EXPIRES_AT_TEXT: '2030-01-01T00:00:00.000000Z',
-            EXPIRED_FLAG: 'N',
-            INVITER_AUTHORIZED_FLAG: 'Y',
-          },
-        ],
-      })
-      .mockResolvedValueOnce({
-        rows: [
-          {
-            USER_ID: raw(actorUserId),
-            PARTICIPANT_ID: raw(actorParticipantId),
-            DISPLAY_NAME: 'Sam',
-            STATUS: 'ACTIVE',
-            VERIFIED_FLAG: 'Y',
-            AVATAR_MEDIA_ID: null,
-          },
-        ],
-      })
-      .mockResolvedValueOnce({
-        rows: [{ MEMBER_ROLE: 'MEMBER', ALLOCATION_ORDER: '1' }],
-      });
-    const repository = new GroupInvitationsRepository({ execute } as unknown as OracleService);
+    const contexts = {
+      findOne: vi.fn().mockResolvedValue({ _id: contextId, status: 'ACTIVE', mutationVersion: 3 }),
+      updateOne: vi.fn(),
+    };
+    const groups = {
+      findOne: vi.fn().mockResolvedValue({ _id: groupId, contextId, name: group.groupName }),
+    };
+    const invitations = {
+      findOne: vi.fn().mockResolvedValue(invitation('ACCEPTED')),
+      updateOne: vi.fn(),
+    };
+    const members = {
+      findOne: vi.fn(async (filter: { participantId?: string }) =>
+        filter.participantId === inviterParticipantId
+          ? { contextId, participantId: inviterParticipantId, status: 'ACTIVE', role: 'OWNER' }
+          : {
+              contextId,
+              participantId: actorParticipantId,
+              status: 'ACTIVE',
+              role: 'MEMBER',
+              allocationOrder: 1,
+            },
+      ),
+      insertOne: vi.fn(),
+    };
+    const users = {
+      findOne: vi.fn().mockResolvedValue({
+        _id: actorUserId,
+        mobileE164: mobileNumber,
+        mobileVerifiedAt: new Date(),
+        status: 'ACTIVE',
+      }),
+    };
+    const participants = {
+      findOne: vi.fn(async (filter: { _id?: string }) =>
+        filter._id === actorParticipantId
+          ? {
+              _id: actorParticipantId,
+              userId: actorUserId,
+              kind: 'USER',
+              displayName: 'Sam',
+            }
+          : { _id: inviterParticipantId, kind: 'USER', displayName: 'Alex' },
+      ),
+    };
+    const outbox = { insertOne: vi.fn() };
+    const audit = { insertOne: vi.fn() };
+    const repository = new GroupInvitationsRepository({} as MongoService);
 
     await expect(
-      repository.accept({} as Connection, {
-        locator: { invitationId, contextId },
-        tokenHash,
-        mobileNumber,
-        actorParticipantId,
-        actorUserId,
-        requestId: 'request-replay',
-      }),
+      repository.accept(
+        createWork({
+          [COLLECTIONS.contexts]: contexts,
+          [COLLECTIONS.groups]: groups,
+          [COLLECTIONS.invitations]: invitations,
+          [COLLECTIONS.contextMembers]: members,
+          [COLLECTIONS.users]: users,
+          [COLLECTIONS.participants]: participants,
+          [COLLECTIONS.outbox]: outbox,
+          [COLLECTIONS.auditEvents]: audit,
+        }),
+        {
+          locator: { invitationId, contextId },
+          tokenHash,
+          mobileNumber,
+          actorParticipantId,
+          actorUserId,
+          requestId: 'request-replay',
+        },
+      ),
     ).resolves.toMatchObject({
       preview: { invitationId, groupId },
-      member: { id: actorParticipantId, status: 'active' },
+      member: { id: actorParticipantId, status: 'active', allocationOrder: 1 },
     });
-    expect(execute).toHaveBeenCalledTimes(4);
-    expect(execute.mock.calls.some((call) => String(call[1]).includes('INSERT INTO'))).toBe(false);
-    expect(
-      execute.mock.calls.some((call) => String(call[1]).trimStart().startsWith('UPDATE ')),
-    ).toBe(false);
+    expect(contexts.updateOne).not.toHaveBeenCalled();
+    expect(invitations.updateOne).not.toHaveBeenCalled();
+    expect(members.insertOne).not.toHaveBeenCalled();
+    expect(outbox.insertOne).not.toHaveBeenCalled();
+    expect(audit.insertOne).not.toHaveBeenCalled();
   });
 
   it('throws on a lost pending-to-accepted transition so membership work rolls back', async () => {
-    const execute = vi
-      .fn()
-      .mockResolvedValueOnce({ rows: [{ CONTEXT_ID: raw(contextId) }] })
-      .mockResolvedValueOnce({
-        rows: [
-          {
-            INVITATION_ID: raw(invitationId),
-            CONTEXT_ID: raw(contextId),
-            INVITER_PARTICIPANT_ID: raw(inviterParticipantId),
-            INVITEE_PARTICIPANT_ID: null,
-            STATUS: 'PENDING',
-            GROUP_ID: raw(groupId),
-            GROUP_NAME: group.groupName,
-            INVITER_DISPLAY_NAME: 'Alex',
-            EXPIRES_AT_TEXT: '2030-01-01T00:00:00.000000Z',
-            EXPIRED_FLAG: 'N',
-            INVITER_AUTHORIZED_FLAG: 'Y',
-          },
-        ],
-      })
-      .mockResolvedValueOnce({
-        rows: [
-          {
-            USER_ID: raw(actorUserId),
-            PARTICIPANT_ID: raw(actorParticipantId),
-            DISPLAY_NAME: 'Sam',
-            STATUS: 'ACTIVE',
-            VERIFIED_FLAG: 'Y',
-            AVATAR_MEDIA_ID: null,
-          },
-        ],
-      })
-      .mockResolvedValueOnce({
-        rows: [{ MEMBER_ROLE: 'MEMBER', ALLOCATION_ORDER: '1' }],
-      })
-      .mockResolvedValueOnce({ rowsAffected: 0 });
-    const repository = new GroupInvitationsRepository({ execute } as unknown as OracleService);
+    const contexts = {
+      findOne: vi.fn().mockResolvedValue({ _id: contextId, status: 'ACTIVE', mutationVersion: 3 }),
+      updateOne: vi.fn().mockResolvedValue({ matchedCount: 1 }),
+    };
+    const groups = {
+      findOne: vi.fn().mockResolvedValue({ _id: groupId, contextId, name: group.groupName }),
+    };
+    const invitations = {
+      findOne: vi.fn().mockResolvedValue(invitation()),
+      updateOne: vi.fn().mockResolvedValue({ modifiedCount: 0 }),
+    };
+    const members = {
+      findOne: vi.fn(async (filter: { participantId?: string }) =>
+        filter.participantId === inviterParticipantId
+          ? { contextId, participantId: inviterParticipantId, status: 'ACTIVE', role: 'OWNER' }
+          : {
+              contextId,
+              participantId: actorParticipantId,
+              status: 'ACTIVE',
+              role: 'MEMBER',
+              allocationOrder: 1,
+            },
+      ),
+    };
+    const users = {
+      findOne: vi.fn().mockResolvedValue({
+        _id: actorUserId,
+        mobileE164: mobileNumber,
+        mobileVerifiedAt: new Date(),
+        status: 'ACTIVE',
+      }),
+    };
+    const participants = {
+      findOne: vi.fn().mockResolvedValue({
+        _id: actorParticipantId,
+        userId: actorUserId,
+        kind: 'USER',
+        displayName: 'Sam',
+      }),
+    };
+    const repository = new GroupInvitationsRepository({} as MongoService);
 
     await expect(
-      repository.accept({} as Connection, {
-        locator: { invitationId, contextId },
-        tokenHash,
-        mobileNumber,
-        actorParticipantId,
-        actorUserId,
-        requestId: 'request-transition-race',
-      }),
+      repository.accept(
+        createWork({
+          [COLLECTIONS.contexts]: contexts,
+          [COLLECTIONS.groups]: groups,
+          [COLLECTIONS.invitations]: invitations,
+          [COLLECTIONS.contextMembers]: members,
+          [COLLECTIONS.users]: users,
+          [COLLECTIONS.participants]: participants,
+        }),
+        {
+          locator: { invitationId, contextId },
+          tokenHash,
+          mobileNumber,
+          actorParticipantId,
+          actorUserId,
+          requestId: 'request-transition-race',
+        },
+      ),
     ).rejects.toThrow('Invitation acceptance was not persisted');
-    expect(execute).toHaveBeenCalledTimes(5);
   });
 });

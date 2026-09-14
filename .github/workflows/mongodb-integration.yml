@@ -1,0 +1,84 @@
+name: MongoDB integration
+
+on:
+  pull_request:
+    paths:
+      - 'database/**'
+      - 'apps/api/**'
+      - 'apps/worker/**'
+      - 'packages/config/**'
+      - 'packages/domain/**'
+      - 'package*.json'
+      - '.github/workflows/mongodb-integration.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mongodb-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mongodb:
+    name: Migrate and test on MongoDB
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NODE_ENV: development
+      MONGODB_URI: mongodb://127.0.0.1:27017/?replicaSet=rs0
+      MONGODB_DATABASE: splito_ci
+      MONGODB_INTEGRATION_URI: mongodb://127.0.0.1:27017/?replicaSet=rs0
+      MONGODB_INTEGRATION_DATABASE: splito_ci
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+      - name: Use Node.js LTS
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Start a single-node MongoDB replica set
+        run: >-
+          docker run --detach --name splito-mongodb --publish 27017:27017
+          mongo:8.0.30-noble --replSet rs0 --bind_ip_all
+      - name: Initialize the replica set
+        run: |
+          for attempt in {1..30}; do
+            if docker exec splito-mongodb mongosh --quiet --eval "db.adminCommand({ ping: 1 })"; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec splito-mongodb mongosh --quiet --eval \
+            "rs.initiate({_id:'rs0',members:[{_id:0,host:'127.0.0.1:27017'}]})"
+          for attempt in {1..30}; do
+            if docker exec splito-mongodb mongosh --quiet --eval \
+              "if (!db.hello().isWritablePrimary) quit(1)"; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+      - name: Apply MongoDB schema
+        run: npm run db:migrate
+      - name: Prove schema setup is idempotent
+        run: npm run db:migrate
+      - name: Verify connection and managed indexes
+        run: |
+          npm run db:verify
+          npm run db:status
+      - name: Seed synthetic financial data
+        env:
+          SPLITO_ALLOW_DEVELOPMENT_SEED: 'true'
+        run: npm run db:seed
+      - name: Reconcile synthetic financial data
+        run: npm run db:reconcile
+      - name: Run MongoDB integration suites
+        env:
+          NODE_ENV: test
+        run: npm run test:integration --workspaces --if-present

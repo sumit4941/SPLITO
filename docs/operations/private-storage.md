@@ -1,11 +1,9 @@
 # Private media storage
 
-Oracle stores authorization, lifecycle, and integrity metadata; it does not
-store user-uploaded image bytes. `SPLITO_ATTACHMENTS` remains the expense receipt
-model. V005 adds `SPLITO_MEDIA_OBJECTS` for normalized profile avatars and group
-images and binds the existing `SPLITO_USERS.AVATAR_KEY` and
-`SPLITO_GROUPS.IMAGE_KEY` pointers back to an object owned by that same user or
-group. Function-based unique indexes permit only one `ACTIVE` image per owner.
+MongoDB stores authorization, lifecycle, and integrity metadata; it does not
+store user-uploaded image bytes. The `mediaObjects` collection records normalized
+profile avatars and group images. Partial unique indexes permit only one
+`ACTIVE` image per owner.
 
 Runtime configuration defines `ATTACHMENT_STORAGE_PATH` and a default
 `MAX_UPLOAD_BYTES` of 10 MB. The same private storage boundary can serve both
@@ -51,8 +49,8 @@ and successful decoder result do not agree. The decoder must enforce at most
 16,777,216 decoded pixels before allocating an unbounded raster. Apply EXIF
 orientation, strip location and other
 unnecessary metadata, remove animation, and encode the stored result as
-`image/webp`. V005 independently constrains the stored result to 10 MB, those
-dimension limits, and a `RAW(32)` SHA-256 digest.
+`image/webp`. The application independently constrains the stored result to 10
+MB, those dimension limits, and a SHA-256 digest.
 
 The current API buffers only the already bounded multipart file (10,000,000
 bytes maximum) for decoding; it never accepts an unbounded body or uses the
@@ -71,14 +69,14 @@ membership for a group image. A UUID or storage key is never authorization, and
 an inaccessible group/image should follow the API's existence-concealing `404`
 policy.
 
-Replacement is a short Oracle transaction after content processing: lock the
-owner, mark the previous media row `SUPERSEDED`, insert the new `ACTIVE` row,
+Replacement is a short MongoDB transaction after content processing: fence the
+owner, mark the previous media document `SUPERSEDED`, insert the new `ACTIVE` document,
 change the owner pointer, update its resource timestamp/version, and record the
 audit event. Media mutations do not currently emit an outbox event; add one in
 the same transaction if a downstream invalidation or notification consumer is
 introduced. If the database transaction fails, delete the new object;
 an orphan sweep remains the backstop because filesystem/object-store changes
-cannot join the Oracle transaction. Deleting an image clears the owner pointer
+cannot join the MongoDB transaction. Deleting an image clears the owner pointer
 before soft-deleting its media row.
 
 Serve image content through an authenticated API handler rather than a static
@@ -102,7 +100,7 @@ delete the key referenced by a current user or group pointer.
 Create a private bucket/container per environment with public access blocked,
 provider-managed or customer-managed encryption, versioning appropriate to the
 retention policy, lifecycle cleanup, access logging, and narrowly scoped
-workload identity. The API should mint short-lived downloads only after Oracle
+workload identity. The API should mint short-lived downloads only after MongoDB-backed
 authorization; storage credentials must not reach the browser or web image.
 
 The local filesystem adapter is a development boundary. Production image writes

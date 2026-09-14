@@ -4,7 +4,7 @@ Status: **not measured**.
 
 The target is p95 below 500 ms for ordinary financial API operations under the
 baseline in `../performance/README.md`, excluding OCR and external-provider
-latency. No valid Oracle-backed baseline run has been executed or attached for
+latency. No valid MongoDB-backed baseline run has been executed or attached for
 this repository state, so no latency, throughput, or capacity claim is made.
 
 ## Result template
@@ -12,7 +12,7 @@ this repository state, so no latency, throughput, or capacity claim is made.
 | Field                                 | Value                              |
 | ------------------------------------- | ---------------------------------- |
 | Application commit/image digest       | Not recorded                       |
-| Oracle version/patch/`COMPATIBLE`     | Not recorded for a performance run |
+| MongoDB version/topology              | Not recorded for a performance run |
 | App/DB hardware and network           | Not recorded                       |
 | Dataset row counts/snapshot           | Not recorded                       |
 | API/worker replicas and pool settings | Not recorded                       |
@@ -20,7 +20,7 @@ this repository state, so no latency, throughput, or capacity claim is made.
 | Throughput                            | Not measured                       |
 | Ordinary operation p50/p95/p99        | Not measured                       |
 | Error/check rate                      | Not measured                       |
-| Pool/Oracle bottleneck observations   | Not measured                       |
+| Pool/MongoDB bottleneck observations  | Not measured                       |
 | Conclusion/limitations                | Pending a reproducible run         |
 
 Populate this file only from the saved raw summary and monitoring evidence. Keep

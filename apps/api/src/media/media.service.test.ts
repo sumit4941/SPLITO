@@ -1,9 +1,8 @@
 import { createHash } from 'node:crypto';
-import type { Connection } from 'oracledb';
 import { describe, expect, it, vi } from 'vitest';
 import type { ContextAccessRepository } from '../access/context-access.repository.js';
 import type { AuthContext } from '../auth/auth.types.js';
-import type { OracleService } from '../database/oracle.service.js';
+import type { MongoService, MongoUnitOfWork } from '../database/mongo.service.js';
 import type { ImageProcessor } from './image.processor.js';
 import type { MediaRepository } from './media.repository.js';
 import { MediaService } from './media.service.js';
@@ -87,13 +86,13 @@ function harness(
     ...options.storage,
   };
   const processor = { process: vi.fn().mockResolvedValue(processed), ...options.processor };
-  const connection = {} as Connection;
-  const oracle = {
-    withConnection: vi.fn(async (operation: (value: Connection) => Promise<unknown>) =>
-      operation(connection),
+  const work = {} as MongoUnitOfWork;
+  const mongo = {
+    withConnection: vi.fn(async (operation: (value: MongoUnitOfWork) => Promise<unknown>) =>
+      operation(work),
     ),
-    withTransaction: vi.fn(async (operation: (value: Connection) => Promise<unknown>) =>
-      operation(connection),
+    withTransaction: vi.fn(async (operation: (value: MongoUnitOfWork) => Promise<unknown>) =>
+      operation(work),
     ),
   };
   return {
@@ -101,9 +100,9 @@ function harness(
     repository,
     storage,
     processor,
-    oracle,
+    mongo,
     service: new MediaService(
-      oracle as unknown as OracleService,
+      mongo as unknown as MongoService,
       access as unknown as ContextAccessRepository,
       repository as unknown as MediaRepository,
       storage as unknown as PrivateMediaStorage,

@@ -1,56 +1,36 @@
-# Backup and restore guide
+# MongoDB backup and restore
 
-Backups are a database/platform-owner responsibility and must cover the Oracle
-CDB/PDB, encryption keys/wallets, private attachments, deployment configuration,
-and provider-secret references. A successful backup command is not restore
-evidence.
+Backups must cover the MongoDB database, private image objects, encryption keys,
+provider configuration, and deployment manifests. A database backup does not
+contain image bytes stored by the private-media adapter.
 
-## Policy baseline
+For production Atlas, enable scheduled cloud backups and continuous backup or
+point-in-time recovery where the selected tier supports them. Keep retention and
+restore permissions separate from the runtime database user. Periodically export
+backup metadata to an independent control plane and alert on failed snapshots.
 
-Define approved RPO/RTO per environment before launch. A reasonable starting
-exercise target is an RPO of 15 minutes and an RTO of 4 hours, but this is not a
-measured commitment. Retain multiple generations, keep an isolated/immutable
-copy, encrypt in transit and at rest, restrict backup roles, and alert on missed
-or unvalidated backups.
+Logical `mongodump` exports are useful for controlled migrations and selective
+recovery, but they are not a replacement for managed snapshots and oplog-backed
+point-in-time recovery. Encrypt every export and never place a URI containing
+credentials in a command history or artifact name.
 
-Use RMAN physical backups as the recovery foundation. Data Pump export of
-`SPLITO_OWNER` is a useful logical supplement for schema inspection or selective
-recovery, not a replacement for physical/redo coverage. Oracle documents PDB
-backup with `BACKUP PLUGGABLE DATABASE FREEPDB1` when connected to the root and
-restore validation with `RESTORE PLUGGABLE DATABASE ... VALIDATE`.
+## Restore drill
 
-References:
+1. Restore into a new isolated Atlas project/cluster or isolated database.
+2. Record the source snapshot timestamp, target cluster, application commit, and
+   expected recovery-point and recovery-time objectives.
+3. Configure a temporary least-privilege database user and restricted IP access.
+4. Run `npm run db:verify`, `npm run db:status`, and `npm run db:reconcile`.
+5. Verify user/group/media counts, one-active-session uniqueness, OTP and
+   invitation index rules, idempotency records, balanced ledger batches,
+   projections, outbox backlog, and audit history.
+6. Restore the matching private-media objects and confirm authorized image reads.
+7. Exercise login, group membership, expense editing, settlement, and worker
+   delivery before approving the drill.
+8. Revoke temporary credentials and delete the isolated target according to the
+   retention policy.
 
-- [Oracle 26ai backup and recovery guide](https://docs.oracle.com/en/database/oracle/oracle-database/26/bradv/)
-- [Backing up a PDB](https://docs.oracle.com/en/database/oracle/oracle-database/26/bradv/backing-up-database.html)
-- [Validating database files and backups](https://docs.oracle.com/en/database/oracle/oracle-database/26/bradv/validating-database-files-backups.html)
+Document evidence without tokens, passwords, complete connection strings,
+session hashes, OTP hashes, or private media.
 
-## Restore exercise
-
-1. Open an incident/change record and choose an isolated target. Do not overwrite
-   production during a test.
-2. Record source backup identifiers, checksums, SCN/time, Oracle patch level,
-   wallet/key versions, attachment snapshot, and application commit.
-3. Restore/recover the CDB or `FREEPDB1` to the target using the approved RMAN
-   procedure. Restore private objects to an isolated bucket/volume with no public
-   access.
-4. Connect with a temporary recovery credential and confirm PDB/open mode,
-   schema migration history/checksums, invalid objects, constraints, row counts,
-   and attachment hashes.
-5. Run `validate-schema.mjs`, report-only journal/projection reconciliation,
-   authorization smoke tests, and sampled receipt retrieval. If a mismatch is
-   found, rehearse the explicit rebuild on this isolated copy before production.
-6. Verify recovery-point age and elapsed recovery time against RPO/RTO. Capture
-   evidence and destroy the isolated copy under policy.
-7. Resolve every discrepancy before marking the backup system healthy.
-
-Point-in-time recovery after a financial corruption must coordinate database and
-private-object versions. Never copy only projection tables as a recovery; rebuild
-them from the restored immutable journal. Never import seed data into a restored
-production schema.
-
-## Current status
-
-This repository supplies the procedure and schema validation hooks. No backup or
-restore was executed during repository construction, so RPO/RTO and restore
-success remain unverified.
+See [Atlas backup, restore, and archive](https://www.mongodb.com/docs/atlas/backup-restore-cluster/).

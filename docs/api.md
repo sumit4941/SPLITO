@@ -1,7 +1,7 @@
 # API contract conventions
 
 All business endpoints live below `/api/v1`; health probes are also versioned.
-The browser uses this API and never Oracle. Runtime OpenAPI is exposed at
+The browser uses this API and never connects to MongoDB. Runtime OpenAPI is exposed at
 `/api/openapi.json`. The checked-in `docs/openapi.json` and
 `packages/api-client` contain the generated contract and the web-facing
 `openapi-fetch` wrapper. The artifact represents only the implemented route
@@ -39,7 +39,7 @@ Errors are never ad-hoc strings:
 }
 ```
 
-Production errors omit stack traces, SQL, credentials, internal IDs not already
+Production errors omit stack traces, database query details, credentials, internal IDs not already
 authorized, and provider payloads.
 
 ## Mutation requirements
@@ -61,7 +61,7 @@ authorized, and provider payloads.
 
 Lists use a stable sort tuple and `nextCursor`. The current token is
 shape-validated base64url JSON, not an integrity-protected credential, and is
-never trusted for authorization. Authorization predicates are part of the SQL
+never trusted for authorization. Authorization predicates are part of the database
 query, not post-filtering; counts, suggestions, and snippets cannot include
 inaccessible records.
 
@@ -109,7 +109,7 @@ IP. Mobile input is normalized to E.164 before lookup.
   SMS unavailability and provider rejection are reported as `503` and `502`
   respectively, never as a false delivery success.
 
-Unknown invitees are not inserted into `SPLITO_PARTICIPANTS` or the group roster.
+Unknown invitees are not inserted into `participants` or the group roster.
 The stored invitation contains the normalized destination and a SHA-256 token
 digest, not the bearer token. The join URL uses `/join#invite=<token>` so the
 token fragment is not sent in the initial HTTP request. Issuing a replacement
@@ -153,7 +153,7 @@ with a different request returns `409`, and non-creators receive a concealed
 membership. Editing cannot move an expense to another group.
 
 The update appends a revision and a balanced reversal/replacement journal in one
-Oracle transaction; it never rewrites the previous revision or postings. All
+MongoDB transaction; it never rewrites the previous revision or postings. All
 active members see the new current representation after commit, but edit
 permission remains with the original creator.
 
@@ -193,10 +193,10 @@ Only a keyed HMAC of the code is persisted; the OTP pepper is independent of
 the session and CSRF secrets. Responses are designed not to disclose whether a
 number already has an account. On the first successful verification of an
 unseen E.164 number, creation of the user, participant, and preferences is
-atomic. Every successful verification revokes the user's prior unrevoked
-session before creating the replacement; Oracle also has a function-based
-unique index permitting only one unrevoked session per user. Because mobile
-numbers are unique identities, that enforces one active login per number.
+atomic. Every successful verification advances the user authentication fence
+and replaces the stable session document keyed by user ID. Unique indexes on
+the external session ID and token digest backstop the one-session slot. Because
+mobile numbers are unique identities, that enforces one active login per number.
 
 In development, the request response may include `developmentOtp` for local
 testability. Production never returns the plaintext code. OTP and group-invite
@@ -208,8 +208,8 @@ or provider acceptance test is claimed. Legacy email/password endpoints may
 remain available to API clients, but they are not exposed by the primary web
 login.
 
-The session cookie contains an opaque random token whose digest is stored in
-Oracle. It is `HttpOnly`, `Secure` in production, narrowly scoped, and uses the
+The session cookie contains an opaque random token whose binary digest is stored
+in MongoDB. It is `HttpOnly`, `Secure` in production, narrowly scoped, and uses the
 documented `SameSite` policy. State-changing cookie-authenticated requests also
 send a CSRF token bound to the session. Authentication tokens never enter
 `localStorage`.

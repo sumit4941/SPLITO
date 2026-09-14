@@ -11,12 +11,11 @@ import {
   parseMinorAmount,
   type AllocationResult,
 } from '@splito/domain';
-import type { Connection } from 'oracledb';
 import { ContextAccessRepository } from '../access/context-access.repository.js';
 import type { AuthContext } from '../auth/auth.types.js';
 import { ApiError } from '../common/api-error.js';
 import { IdempotencyService } from '../idempotency/idempotency.service.js';
-import { OracleService } from '../database/oracle.service.js';
+import { MongoService, type MongoUnitOfWork } from '../database/mongo.service.js';
 import type { ExpenseListQuery, ExpenseMutationInput } from './expenses.schemas.js';
 import {
   ExpensesRepository,
@@ -55,7 +54,7 @@ function decodeCursor(value: string | undefined): ExpenseCursor | undefined {
       typeof parsed.expenseDate !== 'string' ||
       !/^\d{4}-\d{2}-\d{2}$/.test(parsed.expenseDate) ||
       typeof parsed.createdAt !== 'string' ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(parsed.createdAt) ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3,6}Z$/.test(parsed.createdAt) ||
       typeof parsed.id !== 'string'
     ) {
       throw new Error('shape');
@@ -69,20 +68,20 @@ function decodeCursor(value: string | undefined): ExpenseCursor | undefined {
 @Injectable()
 export class ExpensesService {
   constructor(
-    private readonly oracle: OracleService,
+    private readonly mongo: MongoService,
     private readonly access: ContextAccessRepository,
     private readonly repository: ExpensesRepository,
     private readonly idempotency: IdempotencyService,
   ) {}
 
   async preview(input: ExpenseMutationInput, auth: AuthContext): Promise<SplitPreviewResponse> {
-    return this.oracle.withConnection(async (connection) => {
+    return this.mongo.withTransaction(async (connection) => {
       const access = await this.access.contextIdForGroup(
         connection,
         input.groupId,
         auth.user.participantId,
       );
-      const prepared = await this.prepare(connection, input, access.contextId, false);
+      const prepared = await this.prepare(connection, input, access.contextId);
       return this.previewResponse(prepared);
     });
   }
@@ -92,12 +91,12 @@ export class ExpensesService {
     auth: AuthContext,
     values: { readonly idempotencyKey: string; readonly requestId: string },
   ): Promise<{ readonly data: ExpenseSummaryResponse; readonly replayed: boolean }> {
-    return this.oracle.withTransaction(async (connection) => {
+    return this.mongo.withTransaction(async (connection) => {
       const access = await this.access.contextIdForGroup(
         connection,
         input.groupId,
         auth.user.participantId,
-        { lock: true, writable: true },
+        { writable: true },
       );
       const claim = await this.idempotency.claim<ExpenseSummaryResponse>(connection, {
         actorParticipantId: auth.user.participantId,
@@ -107,7 +106,12 @@ export class ExpensesService {
       });
       if (claim.replay) return { data: claim.replay.body, replayed: true };
 
-      const prepared = await this.prepare(connection, input, access.contextId, true);
+      await this.access.requireActiveMember(connection, access.contextId, auth.user.participantId, {
+        lock: true,
+        writable: true,
+      });
+
+      const prepared = await this.prepare(connection, input, access.contextId);
       const ids = {
         expenseId: randomUUID(),
         revisionId: randomUUID(),
@@ -148,11 +152,13 @@ export class ExpensesService {
       readonly requestId: string;
     },
   ): Promise<{ readonly data: ExpenseSummaryResponse; readonly replayed: boolean }> {
-    return this.oracle.withTransaction(async (connection) => {
-      const current = await this.repository.lockExpenseForUpdate(
+    expenseId = expenseId.toLowerCase();
+    return this.mongo.withTransaction(async (connection) => {
+      let current = await this.repository.lockExpenseForUpdate(
         connection,
         expenseId,
         auth.user.participantId,
+        false,
       );
       if (!current) {
         throw new ApiError(
@@ -182,6 +188,20 @@ export class ExpensesService {
       });
       if (claim.replay) return { data: claim.replay.body, replayed: true };
 
+      current = await this.repository.lockExpenseForUpdate(
+        connection,
+        expenseId,
+        auth.user.participantId,
+        true,
+      );
+      if (!current) {
+        throw new ApiError(
+          404,
+          'EXPENSE_NOT_FOUND',
+          'The expense does not exist or is not accessible.',
+        );
+      }
+
       if (current.version !== values.expectedVersion) {
         throw new ApiError(
           412,
@@ -190,7 +210,7 @@ export class ExpensesService {
         );
       }
 
-      const prepared = await this.prepare(connection, input, current.contextId, true);
+      const prepared = await this.prepare(connection, input, current.contextId);
       const previousEffect = await this.repository.currentFinancialEffect(
         connection,
         current.expenseId,
@@ -247,7 +267,7 @@ export class ExpensesService {
     query: ExpenseListQuery,
     auth: AuthContext,
   ): Promise<{ items: ExpenseSummaryResponse[]; nextCursor?: string }> {
-    return this.oracle.withConnection(async (connection) => {
+    return this.mongo.withTransaction(async (connection) => {
       const access = await this.access.contextIdForGroup(
         connection,
         groupId,
@@ -269,7 +289,8 @@ export class ExpensesService {
   }
 
   async detail(expenseId: string, auth: AuthContext): Promise<ExpenseSummaryResponse> {
-    const expense = await this.oracle.withConnection((connection) =>
+    expenseId = expenseId.toLowerCase();
+    const expense = await this.mongo.withTransaction((connection) =>
       this.repository.detail(connection, expenseId, auth.user.participantId),
     );
     if (!expense) {
@@ -283,15 +304,13 @@ export class ExpensesService {
   }
 
   private async prepare(
-    connection: Connection,
+    connection: MongoUnitOfWork,
     input: ExpenseMutationInput,
     contextId: string,
-    lockParticipants: boolean,
   ): Promise<PreparedExpense> {
     const { participants, groupName } = await this.repository.activeParticipants(
       connection,
       contextId,
-      lockParticipants,
     );
     await this.repository.requireActiveCurrency(connection, input.currency);
     const participantById = new Map(

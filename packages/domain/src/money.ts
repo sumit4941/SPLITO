@@ -1,6 +1,6 @@
 import { domainAssert } from './errors.js';
 
-/** Oracle NUMBER(19,0) supports at most 19 decimal digits. */
+/** SPLITO limits persisted minor-unit values to at most 19 decimal digits. */
 export const MAX_MINOR_AMOUNT = 9_999_999_999_999_999_999n;
 
 const CANONICAL_SIGNED_INTEGER = /^(?:0|[1-9][0-9]*|-[1-9][0-9]*)$/;
@@ -50,7 +50,7 @@ export function assertMinorAmount(
   domainAssert(
     amountMinor >= -MAX_MINOR_AMOUNT && amountMinor <= MAX_MINOR_AMOUNT,
     'MINOR_AMOUNT_OUT_OF_RANGE',
-    "The amount exceeds SPLITO's NUMBER(19,0) domain limit.",
+    "The amount exceeds SPLITO's 19-digit minor-unit domain limit.",
     { amountMinor: amountMinor.toString(), maximum: MAX_MINOR_AMOUNT.toString() },
   );
   return amountMinor;

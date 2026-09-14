@@ -22,5 +22,6 @@ COPY --from=build --chown=node:node /workspace/package.json /workspace/package-l
 COPY --from=build --chown=node:node /workspace/node_modules ./node_modules
 COPY --from=build --chown=node:node /workspace/apps/worker ./apps/worker
 COPY --from=build --chown=node:node /workspace/packages/config ./packages/config
+COPY --from=build --chown=node:node /workspace/database ./database
 USER node
 CMD ["node", "apps/worker/dist/main.js"]

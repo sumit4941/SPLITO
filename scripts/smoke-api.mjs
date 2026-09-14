@@ -132,8 +132,8 @@ assert.match(live.headers.get('x-request-id') ?? '', /^[0-9a-f-]{36}$/u);
 checks.push('liveness');
 
 const ready = await request('/api/v1/health/ready');
-expectStatus(ready, 200, 'Oracle readiness');
-checks.push('Oracle readiness');
+expectStatus(ready, 200, 'service readiness');
+checks.push('service readiness');
 
 const anonymous = await request('/api/v1/me');
 expectStatus(anonymous, 401, 'anonymous access denial');

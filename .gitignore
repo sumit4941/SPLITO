@@ -26,7 +26,7 @@ docs/generated/
 .DS_Store
 Thumbs.db
 
-# Private keys, certificates, and Oracle wallets must never enter source control.
+# Private keys, certificates, and credential stores must never enter source control.
 *.pem
 *.key
 *.p12

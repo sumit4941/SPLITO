@@ -3,7 +3,7 @@ import { Injectable } from '@nestjs/common';
 import { generateOpaqueToken, sha256 } from '../auth/auth.crypto.js';
 import { maskMobileNumber } from '../auth/auth.service.js';
 import { ApiError } from '../common/api-error.js';
-import { OracleService } from '../database/oracle.service.js';
+import { MongoService } from '../database/mongo.service.js';
 import type { AuthContext } from '../auth/auth.types.js';
 import {
   GroupInvitationsRepository,
@@ -26,7 +26,7 @@ export class GroupsService {
     private readonly repository: GroupsRepository,
     private readonly invitations: GroupInvitationsRepository,
     private readonly invitationSms: InvitationSmsService,
-    private readonly oracle: OracleService,
+    private readonly mongo: MongoService,
   ) {}
 
   list(auth: AuthContext): Promise<GroupSummary[]> {
@@ -34,8 +34,8 @@ export class GroupsService {
   }
 
   create(input: CreateGroupInput, auth: AuthContext, requestId: string): Promise<GroupSummary> {
-    return this.oracle.withTransaction((connection) =>
-      this.repository.create(connection, {
+    return this.mongo.withTransaction((work) =>
+      this.repository.create(work, {
         ...input,
         groupId: randomUUID(),
         contextId: randomUUID(),
@@ -53,8 +53,8 @@ export class GroupsService {
     groupId: string,
     auth: AuthContext,
   ): Promise<NonNullable<Awaited<ReturnType<GroupsRepository['detail']>>>> {
-    const detail = await this.oracle.withConnection((connection) =>
-      this.repository.detail(connection, groupId, auth.user.participantId),
+    const detail = await this.mongo.withTransaction((work) =>
+      this.repository.detail(work, groupId, auth.user.participantId),
     );
     if (!detail) {
       throw new ApiError(404, 'GROUP_NOT_FOUND', 'The group does not exist or is not accessible.');
@@ -87,15 +87,11 @@ export class GroupsService {
   > {
     const token = generateOpaqueToken();
     const expiresAt = new Date(Date.now() + INVITATION_TTL_MILLISECONDS);
-    const result = await this.oracle.withTransaction(async (connection) => {
-      const group = await this.invitations.lockManagedGroup(
-        connection,
-        groupId,
-        auth.user.participantId,
-      );
+    const result = await this.mongo.withTransaction(async (work) => {
+      const group = await this.invitations.lockManagedGroup(work, groupId, auth.user.participantId);
       this.requireManager(group);
 
-      const target = await this.invitations.findRegisteredTarget(connection, input.mobileNumber);
+      const target = await this.invitations.findRegisteredTarget(work, input.mobileNumber);
       if (target) {
         if (target.status !== 'ACTIVE' || !target.mobileVerified) {
           throw new ApiError(
@@ -104,7 +100,7 @@ export class GroupsService {
             'This mobile number belongs to an account that is not available for group membership.',
           );
         }
-        const membership = await this.invitations.ensureRegisteredMember(connection, {
+        const membership = await this.invitations.ensureRegisteredMember(work, {
           group,
           target,
           actorParticipantId: auth.user.participantId,
@@ -116,7 +112,7 @@ export class GroupsService {
 
       // Fail before persisting an invitation when carrier delivery is unavailable.
       this.invitationSms.assertAvailable();
-      const invitation = await this.invitations.issueInvitation(connection, {
+      const invitation = await this.invitations.issueInvitation(work, {
         group,
         mobileNumber: input.mobileNumber,
         tokenHash: sha256(token),
@@ -158,8 +154,8 @@ export class GroupsService {
     auth: AuthContext,
   ): Promise<InvitationPreview> {
     const mobileNumber = this.requireVerifiedMobile(auth);
-    const invitation = await this.oracle.withConnection((connection) =>
-      this.invitations.preview(connection, sha256(input.token), mobileNumber),
+    const invitation = await this.mongo.withTransaction((work) =>
+      this.invitations.preview(work, sha256(input.token), mobileNumber),
     );
     if (!invitation) this.invalidInvitation();
     return invitation;
@@ -177,10 +173,10 @@ export class GroupsService {
   }> {
     const mobileNumber = this.requireVerifiedMobile(auth);
     const tokenHash = sha256(input.token);
-    const result = await this.oracle.withTransaction(async (connection) => {
-      const locator = await this.invitations.invitationLocator(connection, tokenHash, mobileNumber);
+    const result = await this.mongo.withTransaction(async (work) => {
+      const locator = await this.invitations.invitationLocator(work, tokenHash, mobileNumber);
       if (!locator) return undefined;
-      return this.invitations.accept(connection, {
+      return this.invitations.accept(work, {
         locator,
         tokenHash,
         mobileNumber,

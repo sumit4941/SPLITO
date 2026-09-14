@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import { parseMinorAmount } from '@splito/domain';
-import type { Connection } from 'oracledb';
 import {
   ContextAccessRepository,
   type ContextAccess,
@@ -10,7 +9,7 @@ import type { AuthContext } from '../auth/auth.types.js';
 import { ApiError } from '../common/api-error.js';
 import { ExpensesRepository } from '../expenses/expenses.repository.js';
 import { IdempotencyService } from '../idempotency/idempotency.service.js';
-import { OracleService } from '../database/oracle.service.js';
+import { MongoService, type MongoUnitOfWork } from '../database/mongo.service.js';
 import type { CreateSettlementInput, SettlementPreviewInput } from './settlements.schemas.js';
 import { SettlementsRepository, type CurrentObligation } from './settlements.repository.js';
 
@@ -51,7 +50,7 @@ function previewVersion(
 @Injectable()
 export class SettlementsService {
   constructor(
-    private readonly oracle: OracleService,
+    private readonly mongo: MongoService,
     private readonly access: ContextAccessRepository,
     private readonly expenses: ExpensesRepository,
     private readonly repository: SettlementsRepository,
@@ -59,19 +58,18 @@ export class SettlementsService {
   ) {}
 
   preview(input: SettlementPreviewInput, auth: AuthContext): Promise<SettlementPreviewResponse> {
-    return this.oracle.withConnection(async (connection) => {
+    return this.mongo.withTransaction(async (connection) => {
       const access = await this.access.contextIdForGroup(
         connection,
         input.context.id,
         auth.user.participantId,
       );
-      await this.validateParticipantsAndCurrency(connection, access, input, false);
+      await this.validateParticipantsAndCurrency(connection, access, input);
       const current = await this.repository.currentObligation(connection, {
         contextId: access.contextId,
         senderId: input.senderId,
         recipientId: input.recipientId,
         currency: input.currency,
-        lock: false,
       });
       return this.toPreview(access.contextId, input, current);
     });
@@ -82,12 +80,12 @@ export class SettlementsService {
     auth: AuthContext,
     values: { readonly idempotencyKey: string; readonly requestId: string },
   ): Promise<{ readonly data: SettlementCreatedResponse; readonly replayed: boolean }> {
-    return this.oracle.withTransaction(async (connection) => {
-      const access = await this.access.contextIdForGroup(
+    return this.mongo.withTransaction(async (connection) => {
+      let access = await this.access.contextIdForGroup(
         connection,
         input.context.id,
         auth.user.participantId,
-        { lock: true, writable: true },
+        { writable: true },
       );
       if (
         auth.user.participantId !== input.senderId &&
@@ -108,13 +106,19 @@ export class SettlementsService {
       });
       if (claim.replay) return { data: claim.replay.body, replayed: true };
 
-      await this.validateParticipantsAndCurrency(connection, access, input, true);
+      access = await this.access.requireActiveMember(
+        connection,
+        access.contextId,
+        auth.user.participantId,
+        { lock: true, writable: true },
+      );
+
+      await this.validateParticipantsAndCurrency(connection, access, input);
       const current = await this.repository.currentObligation(connection, {
         contextId: access.contextId,
         senderId: input.senderId,
         recipientId: input.recipientId,
         currency: input.currency,
-        lock: true,
       });
       if (previewVersion(access.contextId, input, current) !== input.previewVersion) {
         throw new ApiError(
@@ -182,16 +186,11 @@ export class SettlementsService {
   }
 
   private async validateParticipantsAndCurrency(
-    connection: Connection,
+    connection: MongoUnitOfWork,
     access: ContextAccess,
     input: SettlementPreviewInput,
-    lock: boolean,
   ): Promise<void> {
-    const { participants } = await this.expenses.activeParticipants(
-      connection,
-      access.contextId,
-      lock,
-    );
+    const { participants } = await this.expenses.activeParticipants(connection, access.contextId);
     const active = new Set(participants.map((participant) => participant.id));
     if (!active.has(input.senderId) || !active.has(input.recipientId)) {
       throw new ApiError(

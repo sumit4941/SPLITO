@@ -69,7 +69,7 @@
         "parameters": [],
         "responses": {
           "200": {
-            "description": "Oracle is ready.",
+            "description": "Service is ready.",
             "content": {
               "application/json": {
                 "schema": {
@@ -121,7 +121,7 @@
             "$ref": "#/components/responses/ServiceUnavailable"
           }
         },
-        "summary": "Oracle-backed readiness",
+        "summary": "MongoDB-backed readiness",
         "tags": ["health"]
       }
     },
@@ -4346,24 +4346,11 @@
       "ReadyStatus": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["status", "database"],
+        "required": ["status"],
         "properties": {
           "status": {
             "type": "string",
             "enum": ["ok"]
-          },
-          "database": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["databaseVersion", "currentSchema"],
-            "properties": {
-              "databaseVersion": {
-                "type": "string"
-              },
-              "currentSchema": {
-                "type": "string"
-              }
-            }
           }
         }
       },

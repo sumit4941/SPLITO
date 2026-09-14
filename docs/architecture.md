@@ -2,211 +2,156 @@
 
 ## System context
 
-SPLITO is an API-first expense-sharing system. The browser never receives an
-Oracle credential and never connects to Oracle. Every authorization decision,
-allocation validation, and authoritative balance calculation occurs in the API.
+SPLITO is an API-first expense-sharing system. The browser connects only to the
+HTTPS API; it never receives database credentials or connects to MongoDB. The
+API remains authoritative for identity, authorization, allocations, journals,
+and balances.
 
 ```mermaid
 flowchart LR
-  Browser[React PWA] -->|HTTPS JSON; SSE planned| API[NestJS / Fastify API]
-  API -->|bound SQL, pooled sessions| Oracle[(Oracle AI Database 26ai)]
-  Worker[Background worker] -->|leased outbox| Oracle
-  Worker -. planned attachment jobs .-> Storage[(Private attachment storage)]
-  API -. planned attachment adapter .-> Storage
-  API -->|bounded, post-commit SMS| SMS[Twilio adapter when activated]
-  Worker -. optional adapters .-> Providers[OCR, FX, email, payment providers]
+  Browser[React PWA] -->|HTTPS JSON| API[NestJS / Fastify API]
+  API -->|MongoDB driver| Mongo[(MongoDB replica set or Atlas)]
+  Worker[Background worker] -->|lease outbox documents| Mongo
+  API -->|bounded post-commit SMS| SMS[SMS provider]
+  API --> Storage[(Private image storage)]
 ```
 
 The monorepo boundaries are:
 
-- `apps/web`: React PWA, local drafts, explicit offline cache, and API client.
-- `apps/api`: versioned REST/SSE interface, authentication, authorization, and
+- `apps/web`: React PWA and generated API client consumption.
+- `apps/api`: versioned REST API, authentication, authorization, and
   transactional orchestration.
-- `apps/worker`: Oracle-backed outbox consumer foundation. A durable-job
-  consumer remains unimplemented.
-- `packages/domain`: deterministic, pure allocation, journal, obligation, and
-  simplification algorithms shared by preview and server validation.
-- `packages/api-client`: checked-in TypeScript types generated from the current
-  OpenAPI document plus an `openapi-fetch` wrapper used by the web application.
-  Regeneration is explicit and the contract covers the implemented route slice,
-  not the full target feature set.
+- `apps/worker`: durable outbox leasing and retry processing.
+- `packages/domain`: deterministic allocation, journal, obligation, and
+  simplification rules.
+- `packages/api-client`: checked-in TypeScript types generated from OpenAPI.
 - `packages/ui`: accessible primitives and design tokens.
-- `packages/config`: validated runtime configuration.
-- `database`: forward-only migrations and synthetic development data.
+- `packages/config`: validated runtime configuration shared by the API and
+  worker.
+- `database`: collection validators, index manifests, forward migration,
+  connection verification, seed, and reconciliation tools.
 
-## Authoritative write path
+## MongoDB transaction boundary
 
-The API treats one financial mutation as one Oracle transaction. It acquires
-context and document locks in stable RAW-ID order, then:
+Financial and membership workflows span collections and therefore require a
+replica set or sharded cluster with transaction support. MongoDB Atlas meets
+that requirement. A standalone `mongod` is intentionally rejected by the
+connection verification tool.
 
-1. Reauthorizes the actor and nested resources.
-2. Claims an actor-and-operation-scoped idempotency key and verifies its request
-   hash.
-3. Checks the resource version (`If-Match`).
-4. Validates membership, currency, payer and beneficiary totals using the domain
-   package.
-5. Inserts an immutable document revision.
-6. Appends a balanced `SPLITO_LEDGER_BATCHES` batch and non-zero
-   `SPLITO_LEDGER_POSTINGS` rows. Zero-net participants are omitted.
-7. Updates rebuildable net and bilateral projections.
-8. Inserts an append-only audit event and an outbox event.
-9. Stores the idempotent HTTP outcome.
-10. Commits explicitly; any failure before commit rolls back DML. Connections
-    are closed in `finally` blocks.
+A financial mutation runs inside one MongoDB transaction:
 
-Oracle commits DDL implicitly, so schema migrations do not use this promise. See
-`operations/migrations.md` for their separate forward-recovery model.
+1. Reauthorize the actor and advance the context mutation fence.
+2. Claim an actor-and-operation-scoped idempotency document and verify its
+   request hash.
+3. Check the resource version supplied by `If-Match`.
+4. Recompute and validate payer, beneficiary, currency, and total invariants in
+   the domain package.
+5. Insert an immutable expense or settlement revision.
+6. Insert a ledger batch containing at least two balanced embedded postings.
+7. Update rebuildable net and bilateral projections.
+8. Insert an audit event and an outbox event.
+9. Store the idempotent HTTP outcome and commit.
+
+Any failure aborts the transaction. The API uses optimistic document filters
+and context `mutationVersion` fences instead of relying on client-side state.
 
 ```mermaid
 sequenceDiagram
   participant C as Client
   participant A as API transaction
-  participant D as Oracle
+  participant D as MongoDB
   participant W as Worker
-  C->>A: POST + Idempotency-Key + If-Match
-  A->>D: lock, authorize, validate
-  A->>D: revision + balanced journal + projections
-  A->>D: audit + outbox + idempotency result
-  A->>D: COMMIT
+  C->>A: Mutation + idempotency key + version
+  A->>D: authorize and claim fences
+  A->>D: revision + balanced batch + projections
+  A->>D: audit + outbox + response snapshot
+  A->>D: commit transaction
   A-->>C: committed representation
-  W->>D: lease committed outbox row
+  W->>D: atomically lease committed outbox document
   W-->>W: perform retry-safe side effect
-  W->>D: mark processed or retry/dead
+  W->>D: mark processed, retry, or dead
 ```
+
+## Data representation
+
+- Collection and field names are lower camel case.
+- Identifiers are canonical lowercase UUID strings. Deterministic development
+  identifiers use the same textual shape.
+- Persisted money is BSON `Decimal128` containing integer minor units. The
+  domain limit is 19 decimal digits; API JSON serializes amounts as decimal
+  strings and never uses binary floating-point for authoritative arithmetic.
+- Audit and lifecycle instants are BSON `Date` values in UTC. A business date is
+  an ISO `YYYY-MM-DD` string paired with an IANA timezone.
+- Revision allocations and ledger postings are embedded because they are
+  immutable and always read with their parent. Mutable heads, memberships,
+  projections, idempotency records, audit events, and outbox events remain
+  separate collections.
+- Sensitive token, OTP, IP, and media hashes are BSON binary values. Plain OTPs,
+  bearer invitation tokens, and database credentials are never persisted.
+
+`database/schema.mjs` is the deployment-time source for collection validators
+and indexes. `apps/api/src/database/mongo.indexes.ts` mirrors the indexes so the
+API can ensure them at startup. Migration applies validators with `collMod` to
+collections that already exist.
 
 ## Mobile identity and session boundary
 
-The React application's only public entry screen is `/login`. It first calls
-`POST /api/v1/auth/mobile/request-otp`, then submits the six-digit code to
-`POST /api/v1/auth/mobile/verify-otp`. The API normalizes the phone to E.164,
-throttles by keyed phone and IP hashes, stores only an OTP-peppered HMAC, and
-enforces a five-minute expiry, 60-second resend interval, and five-attempt cap.
+The public entry route is `/login`. It requests an OTP for an E.164 mobile
+number and verifies the six-digit code. The API applies phone- and IP-keyed
+throttles, stores an OTP-peppered HMAC, and enforces expiry, resend cooldown, and
+attempt limits.
 
-Successful verification enters one Oracle transaction. If the number is
-unseen, the transaction creates the user, participant, and preferences. It then
-locks the identity, revokes any prior unrevoked session, and creates the new
-opaque session. A function-based unique index on `SPLITO_SESSIONS` is the
-database backstop for one active login per user; the unique E.164 identity makes
-that one active login per number.
+One stable OTP slot exists for each `{mobileE164, purpose}` pair; each issuance
+rotates the externally returned `challengeId` and secret material. A first
+successful login transaction creates the user, participant, and preferences.
 
-Development returns `developmentOtp` for OTP testing and captures group-invite
-messages in bounded process memory, exposing the corresponding join URL only in
-the development response. Non-development OTP and invite messages share one
-bounded Twilio REST adapter. Production configuration requires that adapter,
-API-key credentials, and exactly one sender-number or Messaging Service SID;
-invalid or missing configuration fails startup. The HTTP boundary is covered by
-mocked unit tests, but no real carrier delivery is claimed. SMS remains
-vulnerable to phishing, SIM-swap, and operator/network attacks, so stronger
-recovery and passkey MFA are future production controls.
+One stable session slot exists for each user: the session document `_id` is the
+user ID. Login advances the user's `authFence` and atomically replaces that
+slot. Unique indexes protect the external `sessionId` and session-token hash.
+Replacing the document invalidates the prior browser session, enforcing one
+active login for the phone-bound account.
 
-## Mobile group invitation boundary
+Development may return `developmentOtp` for local testing. Production fails
+closed unless an SMS adapter and its required credentials are configured. SMS
+does not protect against SIM-swap or carrier compromise, so stronger recovery
+and passkey MFA remain future controls.
 
-Only an active group owner or administrator can add by mobile number. The API
-locks and reauthorizes the writable group before looking up a normalized E.164
-identity. A verified active user is attached immediately. An unknown number is
-not represented as a participant or member: the transaction instead stores one
-pending, seven-day invitation for the group/number pair, a digest of a random
-opaque token, audit metadata without the number/token, and a minimal outbox
-event. Only masked pending destinations are returned to managers.
+## Group invitations and expense ownership
 
-Carrier delivery runs after that transaction commits. In development it is an
-in-memory capture; in non-development it is the shared Twilio adapter with a
-bounded timeout. A provider failure is therefore reported honestly while the
-pending record remains available for a managed retry. The URL places the bearer
-token in the fragment (`/join#invite=...`), the browser removes the fragment
-after reading it, and preview/accept hash the token before querying Oracle.
+Only an active group owner or administrator can add a member by mobile number.
+An active registered user is attached immediately. An unknown number receives a
+phone-bound registration link; until acceptance, it has an invitation document
+but no participant or membership. Only the invitation-token digest is stored.
+Acceptance binds the token to the signed-in user's verified number and adds at
+most one active membership in a transaction.
 
-Registration uses the existing OTP flow. Preview and acceptance bind the token
-to the authenticated account's verified mobile, the active group, and an
-inviter who still has manager authority. Acceptance locks context and invitation
-state, creates at most one active membership, and changes `PENDING` to
-`ACCEPTED` atomically. A retry by the same account returns the existing
-membership; a different account and invalid/expired/revoked material receive the
-same generic not-found response.
+Every active group member can read group expense entries. Mutation authority is
+narrower: only the active participant stored as the expense creator may edit
+that posted expense. Group administrator status does not override creator
+ownership. Editing appends a revision and balanced reversal/replacement batches;
+it never rewrites historical allocations or postings.
 
-## Expense collaboration boundary
+## Outbox and consistency
 
-Active membership grants read access to group expense list/detail responses,
-including creator identity. Mutation authority is narrower: only the participant
-stored in `SPLITO_EXPENSES.CREATED_BY_PARTICIPANT_ID` can update that expense,
-and only while both membership and context remain active and the document is
-posted. Group owner/administrator role does not override this ownership check.
+MongoDB is authoritative. Browser caches and drafts are non-authoritative and
+must show pending/conflict state explicitly. Original-currency journals never
+mix currencies; converted displays are estimates unless backed by an explicit
+posted conversion workflow.
 
-An update locks the expense, active creator membership, and context, claims the
-actor/operation-scoped idempotency key, then checks `If-Match`. It appends the
-next immutable revision, exactly reverses the prior expense journal effect,
-posts the balanced replacement in its currency, updates projections, and writes
-audit/outbox/idempotency state in one transaction. Cross-group move is rejected.
-`createdBy` and server-computed `canEdit` make this boundary explicit to every
-client.
+The worker atomically changes an available outbox document to a leased state,
+performs the bounded side effect after that claim, and conditionally records
+completion. External delivery is at-least-once. Idempotent handlers and provider
+keys are required wherever a duplicate external effect would matter.
 
-## Oracle integration decisions
+## Deployment boundary
 
-- Observed locally on 2026-09-12: Oracle AI Database 26ai Free
-  `23.26.0.0.0`, `COMPATIBLE=23.6.0`; `FREEPDB1` is open read/write.
-- `FREE` is the CDB root. SPLITO uses `localhost:1521/FREEPDB1`.
-- The API and worker use the official `oracledb` driver in Thin mode only.
-  Thick mode is available solely to a deliberately configured database CLI
-  maintenance task, not to runtime services.
-- `SPLITO_OWNER` owns objects and runs migrations; `SPLITO_APP` only receives
-  required object privileges. The API pool session callback and the worker's
-  connection checkout path use the deployment-validated
-  `DATABASE_OWNER_SCHEMA` identifier and issue
-  `ALTER SESSION SET CURRENT_SCHEMA = SPLITO_OWNER`. There are no public
-  synonyms.
-- IDs are `RAW(16)`. The API removes hyphens from canonical lowercase UUID text
-  before binding a 16-byte buffer, and formats exactly 32 hex digits back as
-  `8-4-4-4-12` lowercase text.
-- Monetary columns are `NUMBER(19,0)`, never fetched as JavaScript `Number`.
-  `oracledb.fetchAsString` and explicit output converters preserve values for
-  `BigInt`; JSON uses decimal strings.
-- JSON payloads use `CLOB` plus `IS JSON`. Native Oracle JSON is available at the
-  observed compatibility level, but CLOB keeps driver and lower-environment
-  compatibility predictable. A future migration may benchmark and adopt OSON.
-- Audit instants are UTC-labelled `TIMESTAMP(6)` values populated with
-  `SYS_EXTRACT_UTC(SYSTIMESTAMP)`. Business dates are midnight `DATE` values and
-  always carry a separate IANA timezone.
-- Stable pagination orders by a business key, creation timestamp, then RAW ID.
-  Page size is bounded. The current cursor is a strictly shape-validated
-  base64url encoding of the last sort tuple, but it is not integrity-protected
-  and is never an authorization input; authorized SQL predicates still apply.
+The Vercel project hosts the static web build. The API and worker require a
+long-running Node.js host with network access to Atlas (or another supported
+MongoDB replica set), private media storage, and configured providers. Runtime
+credentials are supplied only to those backend environments. Readiness pings
+MongoDB internally but returns only `{ "status": "ok" }`.
 
-## Consistency boundaries
-
-Oracle is authoritative. IndexedDB may contain opted-in snapshots, drafts, and
-queued mutations, but UI labels them pending and keeps projected local balances
-separate. Reconnect processing preserves dependency order, submits client IDs
-and idempotency keys, and treats a version conflict as user-visible—not as
-permission to overwrite.
-
-Original-currency journals never mix currencies. Display conversion is an
-estimate. Posted conversion is an explicit document with balanced outgoing and
-incoming batches and a recorded decimal rate.
-
-The worker leases with `SELECT ... FOR UPDATE SKIP LOCKED`, commits the lease,
-then performs a bounded side effect. Network delivery is at-least-once; durable
-uniqueness and idempotent provider keys make business effects effectively once.
-No documentation claims network exactly-once delivery.
-
-## Deployment boundaries
-
-Application containers are stateless except for an explicitly mounted private
-development media volume. Oracle contains media ownership/integrity metadata,
-while normalized image bytes stay outside the database. Production Oracle
-remains external. TLS
-terminates at a trusted ingress, and production Oracle uses TCPS/mTLS where the
-chosen hosting option supports it. Provider adapters are disabled until their
-credentials, webhook verification, legal availability, and sandbox acceptance
-tests are configured. SMS is the implemented exception at the code boundary:
-production configuration requires the Twilio adapter and credentials, while
-operational activation and real carrier acceptance remain deployment gates.
-Missing/invalid configuration or a rejected delivery never becomes a successful
-API response.
-
-## Current implementation boundary
-
-The repository contains the domain foundation, Oracle schema/migration tooling,
-API/worker/web foundations, and deployment/verification scaffolding. The feature
-matrix is the source of truth for route/UI completeness. This architecture is a
-target and a set of enforced database/domain invariants; it is not evidence that
-every feature is implemented or load-tested.
+The feature matrix remains the source of truth for implemented routes and
+remaining evidence. Architecture statements describe enforced code and data
+boundaries; they are not claims that every planned feature or production load
+test is complete.

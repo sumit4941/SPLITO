@@ -1,55 +1,40 @@
-import {
-  assertPdbConnectString,
-  configureOracleMode,
-  loadOracleDb,
-  oracleIdentifier,
-  requiredEnv,
-} from '../lib/oracle-env.mjs';
+import { connectMongo } from '../lib/mongodb-env.mjs';
 
-const oracledb = await loadOracleDb();
-configureOracleMode(oracledb);
-oracledb.outFormat = oracledb.OUT_FORMAT_OBJECT;
-oracledb.fetchAsString = [oracledb.NUMBER];
+const { client, database } = await connectMongo();
 
-const connectString = assertPdbConnectString(
-  'DATABASE_CONNECT_STRING',
-  requiredEnv('DATABASE_CONNECT_STRING'),
-);
-const ownerSchema = oracleIdentifier('DATABASE_OWNER_SCHEMA', requiredEnv('DATABASE_OWNER_SCHEMA'));
-
-let connection;
 try {
-  connection = await oracledb.getConnection({
-    user: requiredEnv('DATABASE_USER'),
-    password: requiredEnv('DATABASE_PASSWORD'),
-    connectString,
-  });
-  connection.callTimeout = 5_000;
-  await connection.execute(`ALTER SESSION SET CURRENT_SCHEMA = ${ownerSchema}`);
+  const hello = await database.admin().command({ hello: 1 });
+  const transactionCapable = Boolean(hello.setName) || hello.msg === 'isdbgrid';
+  if (!transactionCapable) {
+    throw new Error('MongoDB must be a replica set or sharded cluster; standalone is unsupported');
+  }
+  const topology = hello.setName ? `replica set ${String(hello.setName)}` : 'sharded cluster';
 
-  const result = await connection.execute(
-    `SELECT
-       SYS_CONTEXT('USERENV', 'CON_NAME') AS CONTAINER_NAME,
-       SYS_CONTEXT('USERENV', 'SERVICE_NAME') AS SERVICE_NAME,
-       SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') AS CURRENT_SCHEMA
-     FROM DUAL`,
-  );
-  const row = result.rows?.[0];
-  if (!row || row.CONTAINER_NAME === 'CDB$ROOT') {
-    throw new Error('SPLITO runtime connection resolved to CDB$ROOT instead of an application PDB');
+  const session = client.startSession();
+  try {
+    await session.withTransaction(
+      () => database.collection('schemaMigrations').findOne({}, { session }),
+      {
+        readConcern: { level: 'snapshot' },
+        writeConcern: { w: 'majority' },
+      },
+    );
+  } finally {
+    await session.endSession();
   }
 
   process.stdout.write(
     `${JSON.stringify(
       {
-        ...row,
-        DRIVER_MODE: oracledb.thin ? 'thin' : 'thick',
-        SERVER_VERSION: connection.oracleServerVersionString,
+        database: database.databaseName,
+        topology,
+        writablePrimary: hello.isWritablePrimary === true,
+        maxWireVersion: hello.maxWireVersion,
       },
       null,
       2,
     )}\n`,
   );
 } finally {
-  if (connection) await connection.close();
+  await client.close();
 }

@@ -1,8 +1,7 @@
-import type { Connection } from 'oracledb';
+import { Decimal128 } from 'mongodb';
 import { describe, expect, it, vi } from 'vitest';
-import type { OracleService } from '../database/oracle.service.js';
-import { ExpensesRepository } from './expenses.repository.js';
-import type { LockedExpenseForUpdate } from './expenses.repository.js';
+import type { MongoUnitOfWork } from '../database/mongo.service.js';
+import { ExpensesRepository, type LockedExpenseForUpdate } from './expenses.repository.js';
 import type { PreparedExpense } from './expenses.types.js';
 
 const expenseId = '11111111-1111-4111-8111-111111111111';
@@ -18,60 +17,94 @@ const replacementBatchId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const idempotencyId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const actorUserId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 
-const raw = (value: string) => Buffer.from(value.replaceAll('-', ''), 'hex');
+function cursor(rows: unknown[]) {
+  const value = {
+    sort: vi.fn(),
+    limit: vi.fn(),
+    toArray: vi.fn().mockResolvedValue(rows),
+  };
+  value.sort.mockReturnValue(value);
+  value.limit.mockReturnValue(value);
+  return value;
+}
 
-describe('authorized expense detail repository mapping', () => {
-  it('maps current revision, payers, shares, and signed nets with string money', async () => {
-    const execute = vi
-      .fn()
-      .mockResolvedValueOnce({
-        rows: [
-          {
-            EXPENSE_ID: raw(expenseId),
-            DESCRIPTION: 'Dinner',
-            CURRENCY_CODE: 'INR',
-            EXPENSE_DATE_TEXT: '2026-09-12',
-            CATEGORY_CODE: 'food',
-            STATUS: 'POSTED',
-            VERSION_NO: '3',
-            TOTAL_MINOR: '10000',
-            GROUP_ID: raw(groupId),
-            GROUP_NAME: 'Goa trip',
-            NOTES_TEXT: 'Shared meal',
-            CREATED_AT_TEXT: '2026-09-12T12:00:00.000000Z',
-            REVISION_ID: raw(revisionId),
-            REVISION_NO: '2',
-            SPLIT_METHOD: 'EQUAL',
-            ALGORITHM_VERSION: 'splito-largest-remainder-v1',
-            CREATED_BY_ID: raw(callerId),
-            CREATED_BY_NAME: 'Alex',
-            CAN_EDIT_FLAG: 'Y',
-          },
-        ],
-      })
-      .mockResolvedValueOnce({
-        rows: [{ PARTICIPANT_ID: raw(callerId), DISPLAY_NAME: 'Alex', PAID_MINOR: '10000' }],
-      })
-      .mockResolvedValueOnce({
-        rows: [
-          {
-            PARTICIPANT_ID: raw(callerId),
-            DISPLAY_NAME: 'Alex',
-            OWED_MINOR: '5000',
-            INPUT_VALUE_DECIMAL: null,
-          },
-          {
-            PARTICIPANT_ID: raw('55555555-5555-4555-8555-555555555555'),
-            DISPLAY_NAME: 'Sam',
-            OWED_MINOR: '5000',
-            INPUT_VALUE_DECIMAL: null,
-          },
-        ],
-      });
-    const repository = new ExpensesRepository({ execute } as unknown as OracleService);
+function detailWork(expensePresent = true): MongoUnitOfWork {
+  const expense = {
+    _id: expenseId,
+    contextId,
+    description: 'Dinner',
+    currencyCode: 'INR',
+    expenseDate: '2026-09-12',
+    businessTimezone: 'Asia/Kolkata',
+    categoryCode: 'food',
+    status: 'POSTED',
+    createdByParticipantId: callerId,
+    currentRevisionId: revisionId,
+    version: '3',
+    createdAt: new Date('2026-09-12T12:00:00.000Z'),
+    updatedAt: new Date('2026-09-12T12:00:00.000Z'),
+  };
+  const revision = {
+    _id: revisionId,
+    expenseId,
+    revisionNumber: 2,
+    totalMinor: Decimal128.fromString('10000'),
+    splitMethod: 'EQUAL',
+    algorithmVersion: 'splito-largest-remainder-v1',
+    originalInputs: {},
+    notes: 'Shared meal',
+    createdByParticipantId: callerId,
+    payers: [
+      {
+        id: 'payer',
+        participantId: callerId,
+        paidMinor: Decimal128.fromString('10000'),
+        allocationOrder: 0,
+      },
+    ],
+    shares: [
+      {
+        id: 'share-1',
+        participantId: callerId,
+        owedMinor: Decimal128.fromString('5000'),
+        allocationOrder: 0,
+      },
+      {
+        id: 'share-2',
+        participantId: memberId,
+        owedMinor: Decimal128.fromString('5000'),
+        allocationOrder: 1,
+      },
+    ],
+    obligations: [],
+    createdAt: new Date(),
+  };
+  const participants = [
+    { _id: callerId, displayName: 'Alex' },
+    { _id: memberId, displayName: 'Sam' },
+  ];
+  const collections: Record<string, unknown> = {
+    expenses: { findOne: vi.fn().mockResolvedValue(expensePresent ? expense : null) },
+    expenseRevisions: { findOne: vi.fn().mockResolvedValue(revision) },
+    contextMembers: {
+      findOne: vi.fn().mockResolvedValue({ contextId, participantId: callerId, status: 'ACTIVE' }),
+    },
+    groups: { findOne: vi.fn().mockResolvedValue({ _id: groupId, contextId, name: 'Goa trip' }) },
+    contexts: { findOne: vi.fn().mockResolvedValue({ _id: contextId, status: 'ACTIVE' }) },
+    participants: {
+      findOne: vi.fn().mockResolvedValue(participants[0]),
+      find: vi.fn(() => cursor(participants)),
+    },
+  };
+  return {
+    db: { collection: vi.fn((name: string) => collections[name]) },
+  } as unknown as MongoUnitOfWork;
+}
 
-    const detail = await repository.detail({} as Connection, expenseId, callerId);
-
+describe('MongoDB expense detail mapping and authorization', () => {
+  it('maps the embedded current revision with exact Decimal128 minor units', async () => {
+    const repository = new ExpensesRepository();
+    const detail = await repository.detail(detailWork(), expenseId, callerId);
     expect(detail).toMatchObject({
       id: expenseId,
       amount: { amountMinor: '10000', currency: 'INR' },
@@ -79,118 +112,78 @@ describe('authorized expense detail repository mapping', () => {
       version: '3',
       revisionNumber: 2,
       splitMethod: 'equal',
-      algorithmVersion: 'splito-largest-remainder-v1',
       createdBy: { id: callerId, displayName: 'Alex' },
       canEdit: true,
       payers: [{ id: callerId, paidAmountMinor: '10000' }],
       allocations: [
         { id: callerId, owedAmountMinor: '5000', netAmountMinor: '5000' },
-        {
-          id: '55555555-5555-4555-8555-555555555555',
-          owedAmountMinor: '5000',
-          netAmountMinor: '-5000',
-        },
+        { id: memberId, owedAmountMinor: '5000', netAmountMinor: '-5000' },
       ],
-    });
-    const authorizationSql = String(execute.mock.calls[0]?.[1]);
-    expect(authorizationSql).toContain('SPLITO_CONTEXT_MEMBERS');
-    expect(authorizationSql).toContain('CALLER_M.PARTICIPANT_ID = :callerParticipantId');
-    expect(authorizationSql).toContain("EDITOR_M.STATUS = 'ACTIVE'");
-    expect(authorizationSql).toContain("C.STATUS = 'ACTIVE'");
-    expect(execute.mock.calls[0]?.[2]).toMatchObject({
-      expenseId: raw(expenseId),
-      callerParticipantId: raw(callerId),
     });
   });
 
-  it('returns no data and does not query nested rows when authorization filters the expense', async () => {
-    const execute = vi.fn().mockResolvedValueOnce({ rows: [] });
-    const repository = new ExpensesRepository({ execute } as unknown as OracleService);
-
-    await expect(repository.detail({} as Connection, expenseId, callerId)).resolves.toBeUndefined();
-    expect(execute).toHaveBeenCalledTimes(1);
+  it('returns no data when the expense does not exist', async () => {
+    await expect(
+      new ExpensesRepository().detail(detailWork(false), expenseId, callerId),
+    ).resolves.toBeUndefined();
   });
 });
 
-describe('creator-only expense update repository', () => {
-  it('locks the expense head, context, and active caller membership before mapping edit state', async () => {
-    const execute = vi.fn().mockResolvedValueOnce({
-      rows: [
+describe('MongoDB expense ledger behavior', () => {
+  it('loads only the unreversed current batch and validates balanced posting order', async () => {
+    const batch = {
+      _id: previousBatchId,
+      contextId,
+      currencyCode: 'INR',
+      batchType: 'EXPENSE',
+      sourceType: 'EXPENSE',
+      sourceId: expenseId,
+      sourceRevisionId: revisionId,
+      idempotencyId,
+      actorParticipantId: callerId,
+      postedAt: new Date(),
+      postings: [
         {
-          EXPENSE_ID: raw(expenseId),
-          CONTEXT_ID: raw(contextId),
-          GROUP_ID: raw(groupId),
-          GROUP_NAME: 'Goa trip',
-          CONTEXT_STATUS: 'ACTIVE',
-          STATUS: 'POSTED',
-          CURRENCY_CODE: 'INR',
-          VERSION_NO: '3',
-          REVISION_ID: raw(revisionId),
-          REVISION_NO: '2',
-          CREATED_BY_ID: raw(callerId),
-          CREATED_BY_NAME: 'Alex',
+          id: '2',
+          participantId: memberId,
+          amountMinor: Decimal128.fromString('-5000'),
+          postingOrder: 1,
+        },
+        {
+          id: '1',
+          participantId: callerId,
+          amountMinor: Decimal128.fromString('5000'),
+          postingOrder: 0,
         },
       ],
-    });
-    const repository = new ExpensesRepository({ execute } as unknown as OracleService);
-
-    await expect(
-      repository.lockExpenseForUpdate({} as Connection, expenseId, callerId),
-    ).resolves.toEqual({
+    };
+    const revision = {
+      _id: revisionId,
       expenseId,
-      contextId,
-      groupId,
-      groupName: 'Goa trip',
-      contextStatus: 'ACTIVE',
-      status: 'POSTED',
-      currency: 'INR',
-      version: '3',
-      revisionId,
-      revisionNumber: 2,
-      createdByParticipantId: callerId,
-      createdByDisplayName: 'Alex',
-    });
-    const sql = String(execute.mock.calls[0]?.[1]);
-    expect(sql).toContain("CALLER_M.STATUS = 'ACTIVE'");
-    expect(sql).toContain('E.CREATED_BY_PARTICIPANT_ID = :callerParticipantId');
-    expect(sql).toContain("E.STATUS = 'POSTED'");
-    expect(sql).toContain("C.STATUS = 'ACTIVE'");
-    expect(sql).toContain('FOR UPDATE OF E.VERSION_NO, C.STATUS, CALLER_M.STATUS');
-  });
-
-  it('loads only the unreversed current expense batch and preserves exact posting order', async () => {
-    const execute = vi
-      .fn()
-      .mockResolvedValueOnce({
-        rows: [
-          {
-            BATCH_ID: raw(previousBatchId),
-            CONTEXT_ID: raw(contextId),
-            CURRENCY_CODE: 'INR',
-          },
-        ],
-      })
-      .mockResolvedValueOnce({
-        rows: [
-          {
-            DEBTOR_PARTICIPANT_ID: raw(memberId),
-            CREDITOR_PARTICIPANT_ID: raw(callerId),
-            AMOUNT_MINOR: '5000',
-            MATCH_ORDER: '0',
-          },
-        ],
-      })
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({
-        rows: [
-          { PARTICIPANT_ID: raw(callerId), AMOUNT_MINOR: '5000', POSTING_ORDER: '0' },
-          { PARTICIPANT_ID: raw(memberId), AMOUNT_MINOR: '-5000', POSTING_ORDER: '1' },
-        ],
-      });
-    const repository = new ExpensesRepository({ execute } as unknown as OracleService);
+      obligations: [
+        {
+          id: 'obligation',
+          debtorParticipantId: memberId,
+          creditorParticipantId: callerId,
+          amountMinor: Decimal128.fromString('5000'),
+          matchOrder: 0,
+          algorithmVersion: 'v1',
+        },
+      ],
+    };
+    const ledgerFindOne = vi.fn().mockResolvedValue(null);
+    const work = {
+      db: {
+        collection: vi.fn((name: string) =>
+          name === 'ledgerBatches'
+            ? { find: vi.fn(() => cursor([batch])), findOne: ledgerFindOne }
+            : { findOne: vi.fn().mockResolvedValue(revision) },
+        ),
+      },
+    } as unknown as MongoUnitOfWork;
 
     await expect(
-      repository.currentFinancialEffect({} as Connection, expenseId, revisionId),
+      new ExpensesRepository().currentFinancialEffect(work, expenseId, revisionId),
     ).resolves.toEqual({
       batchId: previousBatchId,
       batchContextId: contextId,
@@ -208,20 +201,27 @@ describe('creator-only expense update repository', () => {
         },
       ],
     });
-    expect(String(execute.mock.calls[0]?.[1])).toContain("B.BATCH_TYPE = 'EXPENSE'");
-    expect(String(execute.mock.calls[2]?.[1])).toContain('REVERSES_BATCH_ID = :batchId');
-    expect(String(execute.mock.calls[3]?.[1])).toContain('ORDER BY P.POSTING_ORDER');
+    expect(ledgerFindOne).toHaveBeenCalledWith({ reversesBatchId: previousBatchId }, undefined);
   });
 
-  it('writes an immutable revision, exact reversal, replacement, projections, outbox, and audit', async () => {
-    const execute = vi.fn().mockImplementation((_connection, sql: string) => {
-      if (sql.includes('UPDATE SPLITO_EXPENSES')) return Promise.resolve({ rowsAffected: 1 });
-      if (sql.includes('SELECT TO_CHAR(LOW_OWES_HIGH_MINOR_SIGNED)')) {
-        return Promise.resolve({ rows: [{ AMOUNT_MINOR: '5000' }] });
-      }
-      return Promise.resolve({ rows: [], rowsAffected: 1 });
-    });
-    const repository = new ExpensesRepository({ execute } as unknown as OracleService);
+  it('writes immutable revision, reversal, replacement, outbox, audit, and projection deltas', async () => {
+    const inserted: Record<string, Record<string, unknown>[]> = {};
+    const expenseUpdate = vi.fn().mockResolvedValue({ modifiedCount: 1 });
+    const work = {
+      db: {
+        collection: vi.fn((name: string) => ({
+          insertOne: vi.fn(async (document: Record<string, unknown>) => {
+            (inserted[name] ??= []).push(document);
+            return { acknowledged: true };
+          }),
+          updateOne:
+            name === 'expenses' ? expenseUpdate : vi.fn().mockResolvedValue({ modifiedCount: 1 }),
+        })),
+      },
+    } as unknown as MongoUnitOfWork;
+    const repository = new ExpensesRepository();
+    const balance = vi.spyOn(repository, 'applyBalanceDelta').mockResolvedValue(undefined);
+    const bilateral = vi.spyOn(repository, 'applyBilateralDelta').mockResolvedValue(undefined);
     const current: LockedExpenseForUpdate = {
       expenseId,
       contextId,
@@ -264,18 +264,14 @@ describe('creator-only expense update repository', () => {
         { participantId: memberId, amountMinor: -3000n },
       ],
       obligations: [
-        {
-          debtorParticipantId: memberId,
-          creditorParticipantId: callerId,
-          amountMinor: 3000n,
-        },
+        { debtorParticipantId: memberId, creditorParticipantId: callerId, amountMinor: 3000n },
       ],
       algorithmVersion: 'splito-largest-remainder-v1',
       bilateralAlgorithmVersion: 'splito-bilateral-greedy-v1',
       splitMethod: 'equal',
     };
 
-    await repository.replacePostedExpense({} as Connection, {
+    await repository.replacePostedExpense(work, {
       current,
       previousEffect: {
         batchId: previousBatchId,
@@ -306,62 +302,33 @@ describe('creator-only expense update repository', () => {
       businessTimezone: 'Asia/Kolkata',
     });
 
-    const calls = execute.mock.calls.map((call) => ({
-      sql: String(call[1]),
-      binds: call[2] as Record<string, unknown>,
-    }));
-    const revision = calls.find((call) =>
-      call.sql.includes('INSERT INTO SPLITO_EXPENSE_REVISIONS'),
-    );
-    expect(revision?.sql).toContain('PREVIOUS_REVISION_ID');
-    expect(revision?.binds).toMatchObject({
-      revisionId: raw(nextRevisionId),
-      previousRevisionId: raw(revisionId),
+    expect(inserted.expenseRevisions?.[0]).toMatchObject({
+      _id: nextRevisionId,
+      previousRevisionId: revisionId,
       revisionNumber: 3,
     });
-
-    const head = calls.find((call) => call.sql.includes('UPDATE SPLITO_EXPENSES'));
-    expect(head?.sql).toContain('VERSION_NO = VERSION_NO + 1');
-    expect(head?.sql).toContain('AND VERSION_NO = :expectedVersion');
-    expect(head?.binds).toMatchObject({ expectedVersion: '3', revisionId: raw(nextRevisionId) });
-
-    const batchCalls = calls.filter((call) =>
-      call.sql.includes('INSERT INTO SPLITO_LEDGER_BATCHES'),
+    expect(expenseUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: expenseId, version: '3', currentRevisionId: revisionId }),
+      expect.objectContaining({
+        $set: expect.objectContaining({ version: '4', currentRevisionId: nextRevisionId }),
+      }),
+      undefined,
     );
-    expect(batchCalls).toHaveLength(2);
-    expect(batchCalls[0]?.sql).toContain("'REVERSAL'");
-    expect(batchCalls[0]?.binds).toMatchObject({
+    expect(inserted.ledgerBatches).toHaveLength(2);
+    expect(inserted.ledgerBatches?.[0]).toMatchObject({
+      _id: reversalBatchId,
+      batchType: 'REVERSAL',
+      reversesBatchId: previousBatchId,
       currencyCode: 'INR',
-      reversesBatchId: raw(previousBatchId),
-      revisionId: raw(revisionId),
     });
-    expect(batchCalls[1]?.sql).toContain("'EXPENSE'");
-    expect(batchCalls[1]?.binds).toMatchObject({
+    expect(inserted.ledgerBatches?.[1]).toMatchObject({
+      _id: replacementBatchId,
+      batchType: 'EXPENSE',
       currencyCode: 'USD',
-      revisionId: raw(nextRevisionId),
     });
-
-    const postingCalls = calls.filter((call) =>
-      call.sql.includes('INSERT INTO SPLITO_LEDGER_POSTINGS'),
-    );
-    expect(postingCalls.map((call) => call.binds.amountMinor)).toEqual([
-      '-5000',
-      '5000',
-      '3000',
-      '-3000',
-    ]);
-    expect(postingCalls.slice(0, 2).map((call) => call.binds.postingOrder)).toEqual([0, 1]);
-
-    const balanceCalls = calls.filter((call) =>
-      call.sql.includes('MERGE INTO SPLITO_BALANCE_PROJECTIONS'),
-    );
-    expect(balanceCalls.map((call) => [call.binds.currencyCode, call.binds.deltaMinor])).toEqual([
-      ['INR', '-5000'],
-      ['INR', '5000'],
-      ['USD', '3000'],
-      ['USD', '-3000'],
-    ]);
-    expect(calls.some((call) => call.sql.includes("'expense.updated'"))).toBe(true);
-    expect(calls.some((call) => call.sql.includes("'expense.update'"))).toBe(true);
+    expect(balance).toHaveBeenCalledTimes(4);
+    expect(bilateral).toHaveBeenCalledTimes(2);
+    expect(inserted.outbox?.[0]).toMatchObject({ eventType: 'expense.updated', status: 'PENDING' });
+    expect(inserted.auditEvents?.[0]).toMatchObject({ actionKey: 'expense.update' });
   });
 });

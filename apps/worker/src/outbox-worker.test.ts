@@ -1,5 +1,5 @@
 import { loadWorkerEnvironment, type Environment } from '@splito/config';
-import type { Connection, Pool } from 'oracledb';
+import type { Db, MongoClient } from 'mongodb';
 import type { Logger } from 'pino';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -9,72 +9,53 @@ import {
 } from './outbox-worker.js';
 
 function environment(overrides: NodeJS.ProcessEnv = {}): Environment {
-  return loadWorkerEnvironment({ DATABASE_PASSWORD: 'worker-database-password', ...overrides });
+  return loadWorkerEnvironment(overrides);
 }
 
 function productionEnvironment(): Environment {
   return environment({
     NODE_ENV: 'production',
-    COOKIE_SECURE: 'true',
-    WEB_ORIGIN: 'https://app.splito.example',
+    MONGODB_URI: 'mongodb+srv://worker:placeholder@example.mongodb.net/',
   });
 }
 
 function loggerMock(): Logger {
-  return {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-  } as unknown as Logger;
+  return { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger;
 }
 
-function connectionMock(...results: unknown[]): {
-  connection: Connection;
-  execute: ReturnType<typeof vi.fn>;
-  commit: ReturnType<typeof vi.fn>;
-  rollback: ReturnType<typeof vi.fn>;
-  close: ReturnType<typeof vi.fn>;
-} {
-  const execute = vi.fn();
-  for (const result of results) execute.mockResolvedValueOnce(result);
-  const commit = vi.fn().mockResolvedValue(undefined);
-  const rollback = vi.fn().mockResolvedValue(undefined);
-  const close = vi.fn().mockResolvedValue(undefined);
+function outboxDocument(attempts = 1): object {
   return {
-    connection: { callTimeout: 0, execute, commit, rollback, close } as unknown as Connection,
-    execute,
-    commit,
-    rollback,
-    close,
+    _id: '11111111-1111-4111-8111-111111111111',
+    eventType: 'EXAMPLE_CREATED',
+    aggregateType: 'EXAMPLE',
+    aggregateId: '22222222-2222-4222-8222-222222222222',
+    payload: { kind: 'example' },
+    status: 'LEASED',
+    attempts,
+    availableAt: new Date(0),
+    leasedUntil: new Date(Date.now() + 60_000),
+    leaseOwner: 'worker',
+    createdAt: new Date(0),
   };
 }
 
-function poolMock(...connections: Connection[]): {
-  pool: Pool;
-  getConnection: ReturnType<typeof vi.fn>;
-  close: ReturnType<typeof vi.fn>;
-} {
-  const getConnection = vi.fn();
-  for (const connection of connections) getConnection.mockResolvedValueOnce(connection);
+function mongoMock(claims: unknown[] = [], updates: unknown[] = []) {
+  const findOneAndUpdate = vi.fn();
+  for (const claim of claims) findOneAndUpdate.mockResolvedValueOnce(claim);
+  findOneAndUpdate.mockResolvedValue(undefined);
+  const updateOne = vi.fn();
+  for (const update of updates) updateOne.mockResolvedValueOnce(update);
+  updateOne.mockResolvedValue({ modifiedCount: 1 });
+  const updateMany = vi.fn().mockResolvedValue({ modifiedCount: 0 });
+  const collection = { findOneAndUpdate, updateMany, updateOne };
+  const database = { collection: vi.fn(() => collection) } as unknown as Db;
   const close = vi.fn().mockResolvedValue(undefined);
-  return { pool: { getConnection, close } as unknown as Pool, getConnection, close };
-}
-
-function outboxRow(attempts: string | number, payload: unknown = '{"kind":"example"}'): object {
-  return {
-    OUTBOX_ID: Buffer.alloc(16, 1),
-    EVENT_TYPE: 'EXAMPLE_CREATED',
-    AGGREGATE_TYPE: 'EXAMPLE',
-    AGGREGATE_ID: Buffer.alloc(16, 2),
-    PAYLOAD_JSON: payload,
-    ATTEMPTS: attempts,
-  };
+  const client = { close } as unknown as MongoClient;
+  return { client, database, collection, findOneAndUpdate, updateMany, updateOne, close };
 }
 
 describe('OutboxWorker', () => {
-  afterEach(() => {
-    vi.useRealTimers();
-  });
+  afterEach(() => vi.useRealTimers());
 
   it('refuses to construct the development acknowledgement sink in production', () => {
     expect(() => createDevelopmentHandler(productionEnvironment(), loggerMock())).toThrow(
@@ -83,16 +64,14 @@ describe('OutboxWorker', () => {
   });
 
   it('requires a handler before its polling loop can start', () => {
-    const { pool } = poolMock();
-    const worker = new OutboxWorker(pool, environment(), loggerMock());
+    const mongo = mongoMock();
+    const worker = new OutboxWorker(mongo.client, mongo.database, environment(), loggerMock());
     expect(() => worker.start()).toThrow(/At least one outbox handler/u);
   });
 
-  it('reclaims expired leases and parses attempt counts fetched as Oracle strings', async () => {
-    const claim = connectionMock(undefined, { rows: [outboxRow('1')] }, { rowsAffected: 1 });
-    const finish = connectionMock(undefined, { rowsAffected: 1 });
-    const { pool } = poolMock(claim.connection, finish.connection);
-    const worker = new OutboxWorker(pool, environment(), loggerMock());
+  it('atomically reclaims an eligible event and records completion', async () => {
+    const mongo = mongoMock([outboxDocument(2)], [{ modifiedCount: 1 }]);
+    const worker = new OutboxWorker(mongo.client, mongo.database, environment(), loggerMock());
     let observed: ClaimedOutboxEvent | undefined;
     worker.register('EXAMPLE_CREATED', (event) => {
       observed = event;
@@ -100,36 +79,71 @@ describe('OutboxWorker', () => {
     });
 
     await expect(worker.runOnce(1)).resolves.toBe(1);
-
     expect(observed?.attempts).toBe(2);
-    const selectSql = claim.execute.mock.calls[1]?.[0] as string;
-    expect(selectSql).toContain("STATUS = 'LEASED'");
-    expect(selectSql).toContain('LEASED_UNTIL_UTC <');
-    expect(claim.commit).toHaveBeenCalledOnce();
-    expect(finish.execute).toHaveBeenCalledTimes(2);
+    expect(observed?.payload).toEqual({ kind: 'example' });
+    expect(mongo.findOneAndUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attempts: { $lt: expect.any(Number) },
+        $or: expect.any(Array),
+      }),
+      expect.objectContaining({ $inc: { attempts: 1 } }),
+      expect.objectContaining({ returnDocument: 'after' }),
+    );
+    expect(mongo.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'LEASED' }),
+      expect.objectContaining({ $set: expect.objectContaining({ status: 'PROCESSED' }) }),
+    );
   });
 
-  it('fails closed instead of substituting an empty object for an unknown payload', async () => {
-    const claim = connectionMock(
-      undefined,
-      { rows: [outboxRow('0', { unexpected: true })] },
-      { rowsAffected: 1 },
+  it('dead-letters an expired lease at the attempt limit without dispatching it again', async () => {
+    const mongo = mongoMock();
+    const worker = new OutboxWorker(
+      mongo.client,
+      mongo.database,
+      environment({ OUTBOX_MAX_ATTEMPTS: '3' }),
+      loggerMock(),
     );
-    const { pool } = poolMock(claim.connection);
-    const worker = new OutboxWorker(pool, environment(), loggerMock());
     const handler = vi.fn().mockResolvedValue(undefined);
     worker.register('EXAMPLE_CREATED', handler);
 
-    await expect(worker.runOnce(1)).rejects.toThrow(/Unsupported Oracle representation/u);
-    expect(claim.rollback).toHaveBeenCalledOnce();
+    await expect(worker.runOnce(1)).resolves.toBe(0);
+    expect(mongo.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attempts: { $gte: 3 },
+        $or: expect.arrayContaining([
+          expect.objectContaining({ status: 'LEASED', leasedUntil: { $lt: expect.any(Date) } }),
+        ]),
+      }),
+      expect.objectContaining({ $set: expect.objectContaining({ status: 'DEAD' }) }),
+    );
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it('waits for an in-flight dispatch before closing the Oracle pool', async () => {
-    const claim = connectionMock(undefined, { rows: [outboxRow('0')] }, { rowsAffected: 1 });
-    const finish = connectionMock(undefined, { rowsAffected: 1 });
-    const { pool, close } = poolMock(claim.connection, finish.connection);
-    const worker = new OutboxWorker(pool, environment(), loggerMock());
+  it('fails closed on an invalid persisted attempt count', async () => {
+    const mongo = mongoMock([outboxDocument(Number.NaN)]);
+    const worker = new OutboxWorker(mongo.client, mongo.database, environment(), loggerMock());
+    const handler = vi.fn().mockResolvedValue(undefined);
+    worker.register('EXAMPLE_CREATED', handler);
+
+    await expect(worker.runOnce(1)).rejects.toThrow(/invalid outbox attempt count/u);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('records a retry even when a handler rejects without an error object', async () => {
+    const mongo = mongoMock([outboxDocument()], [{ modifiedCount: 1 }]);
+    const worker = new OutboxWorker(mongo.client, mongo.database, environment(), loggerMock());
+    worker.register('EXAMPLE_CREATED', () => Promise.reject(undefined));
+
+    await expect(worker.runOnce(1)).resolves.toBe(1);
+    expect(mongo.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'LEASED' }),
+      expect.objectContaining({ $set: expect.objectContaining({ status: 'RETRY' }) }),
+    );
+  });
+
+  it('waits for an in-flight dispatch before closing the MongoDB client', async () => {
+    const mongo = mongoMock([outboxDocument()], [{ modifiedCount: 1 }]);
+    const worker = new OutboxWorker(mongo.client, mongo.database, environment(), loggerMock());
     let releaseHandler: (() => void) | undefined;
     const handlerStarted = new Promise<void>((resolveStarted) => {
       worker.register(
@@ -145,21 +159,21 @@ describe('OutboxWorker', () => {
     worker.start();
     await handlerStarted;
     const stopping = worker.stop();
-    expect(close).not.toHaveBeenCalled();
+    expect(mongo.close).not.toHaveBeenCalled();
     releaseHandler?.();
     await stopping;
-
-    expect(finish.execute).toHaveBeenCalledTimes(2);
-    expect(close).toHaveBeenCalledOnce();
+    expect(mongo.close).toHaveBeenCalledOnce();
   });
 
   it('renews the lease while a long-running handler is in flight', async () => {
     vi.useFakeTimers();
-    const claim = connectionMock(undefined, { rows: [outboxRow('0')] }, { rowsAffected: 1 });
-    const renewal = connectionMock(undefined, { rowsAffected: 1 });
-    const finish = connectionMock(undefined, { rowsAffected: 1 });
-    const { pool } = poolMock(claim.connection, renewal.connection, finish.connection);
-    const worker = new OutboxWorker(pool, environment({ OUTBOX_LEASE_SECONDS: '5' }), loggerMock());
+    const mongo = mongoMock([outboxDocument()], [{ modifiedCount: 1 }, { modifiedCount: 1 }]);
+    const worker = new OutboxWorker(
+      mongo.client,
+      mongo.database,
+      environment({ OUTBOX_LEASE_SECONDS: '5' }),
+      loggerMock(),
+    );
     let releaseHandler: (() => void) | undefined;
     let notifyStarted: (() => void) | undefined;
     const handlerStarted = new Promise<void>((resolve) => {
@@ -177,11 +191,12 @@ describe('OutboxWorker', () => {
     const running = worker.runOnce(1);
     await handlerStarted;
     await vi.advanceTimersByTimeAsync(2_500);
-
-    expect(renewal.execute).toHaveBeenCalledTimes(2);
-    expect(renewal.execute.mock.calls[1]?.[0]).toContain('LEASED_UNTIL_UTC >=');
+    expect(mongo.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ leasedUntil: expect.objectContaining({ $gte: expect.any(Date) }) }),
+      expect.objectContaining({ $set: { leasedUntil: expect.any(Date) } }),
+    );
     releaseHandler?.();
     await running;
-    expect(finish.execute).toHaveBeenCalledTimes(2);
+    expect(mongo.updateOne).toHaveBeenCalledTimes(2);
   });
 });

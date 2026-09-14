@@ -610,19 +610,8 @@ export function applyOpenApiContract(document: OpenAPIObject): OpenAPIObject {
     ReadyStatus: {
       type: 'object',
       additionalProperties: false,
-      required: ['status', 'database'],
-      properties: {
-        status: { type: 'string', enum: ['ok'] },
-        database: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['databaseVersion', 'currentSchema'],
-          properties: {
-            databaseVersion: { type: 'string' },
-            currentSchema: { type: 'string' },
-          },
-        },
-      },
+      required: ['status'],
+      properties: { status: { type: 'string', enum: ['ok'] } },
     },
     RegistrationEnvelope: dataEnvelope(ref('RegistrationResult')),
     UserEnvelope: dataEnvelope(ref('User')),
@@ -696,7 +685,7 @@ export function applyOpenApiContract(document: OpenAPIObject): OpenAPIObject {
   };
 
   set('/api/v1/health/live', 'get', '200', jsonResponse('Process is live.', ref('LiveStatus')));
-  set('/api/v1/health/ready', 'get', '200', jsonResponse('Oracle is ready.', ref('ReadyStatus')));
+  set('/api/v1/health/ready', 'get', '200', jsonResponse('Service is ready.', ref('ReadyStatus')));
   set(
     '/api/v1/auth/register',
     'post',

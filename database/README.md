@@ -1,53 +1,52 @@
-# SPLITO Oracle database
+# SPLITO MongoDB database
 
-SPLITO uses Oracle as its only authoritative relational store. The local Oracle
-26ai installation exposes both `FREE` (the container database root) and
-`FREEPDB1` (the writable pluggable database). Application schemas belong in
-`FREEPDB1`; do not point the app or migration runner at `FREE`.
-
-All application-owned tables are deliberately named with the `SPLITO_` prefix.
-The prefix check in `scripts/check-prefix.mjs` fails when a table in the
-dedicated owner schema violates that rule.
+SPLITO uses MongoDB as its authoritative store. Financial workflows span
+multiple collections, so every environment must use a replica set or sharded
+cluster with transaction support. MongoDB Atlas satisfies this requirement; a
+standalone local `mongod` does not.
 
 ## Layout
 
-- `admin/bootstrap-users.mjs` creates the dedicated owner/migration and runtime
-  users. It is the only script that needs a database administrator credential.
-- `migrations/` contains immutable, ordered, forward-only migrations.
-- V005 keeps profile/group image bytes in private storage while Oracle enforces
-  owner-bound metadata, current-image uniqueness, and validated user/group
-  storage-key pointers in `SPLITO_MEDIA_OBJECTS`.
-- `scripts/migrate.mjs` checks SHA-256 checksums and atomically claims/renews a
-  durable owner-token lease in `SPLITO_MIGRATION_LOCK` before executing DDL.
-- `scripts/verify-connection.mjs` verifies the server, PDB, driver mode, and
-  important compatibility settings without changing the database.
-- `seed/development.sql` is synthetic development data and is never run by the
-  migration runner.
+- `schema.mjs` is the canonical definition of the 24 application collections,
+  JSON Schema validators, managed indexes, and reference currencies.
+- `scripts/migrate.mjs` creates missing collections and indexes, loads immutable
+  currency reference data, and records a checksum in `schemaMigrations`.
+- `scripts/validate-schema.mjs` checks required collections, validators, index
+  definitions, and the applied schema version.
+- `scripts/verify-connection.mjs` performs a safe ping and reports topology
+  metadata without printing the connection string.
+- `seed/development.mjs` loads deterministic synthetic users, a group, one
+  balanced expense, and projections for local development only.
+- `scripts/reconcile.mjs` compares balance projections with the embedded ledger
+  postings and can rebuild them transactionally.
 
 ## First-time setup
 
-1. Copy `.env.example` to an ignored `.env` and generate new passwords. Never
-   use the administrator password as an application password.
-2. Set `SPLITO_ADMIN_DB_CONNECT_STRING=localhost:1521/FREEPDB1`, the temporary
-   admin variables, owner variables, and bootstrap runtime-user variables.
-3. Run `npm run db:bootstrap` once, then remove the admin password from both
-   `.env` and the process environment.
-4. Run `npm run db:migrate` with the owner credentials.
-5. Configure the application-facing `DATABASE_*` variables, including
-   `DATABASE_OWNER_SCHEMA=SPLITO_OWNER`. Run `npm run db:check-prefix` and
-   `npm run db:status` with owner credentials, then `npm run db:verify` with
-   runtime credentials.
-6. For development only, set `NODE_ENV=development` and
-   `SPLITO_ALLOW_DEVELOPMENT_SEED=true`, then run `npm run db:seed`. The raw SQL
-   is an internal deterministic fixture and must not be executed directly,
-   because the wrapper adds runnable Argon2id credentials before committing.
+1. Create a production API database user backed by a custom role. Grant
+   `find`/`insert` only on immutable revisions, ledger batches, idempotency
+   receipts, and audit events; grant only the required read/write actions on
+   mutable identity, group, expense head, projection, invitation, media,
+   idempotency-slot, and outbox collections. Also allow it to read
+   `schemaMigrations` and `currencies`, and grant the read-only `listCollections`
+   and `listIndexes` metadata actions used by startup drift verification.
+2. Create a separate worker database user that can read the schema marker and
+   `find`/`update` only `outbox`, plus `listCollections`/`listIndexes` metadata
+   actions for that collection. The built-in `readWrite` role is a local
+   development convenience and cannot enforce immutable provenance.
+3. Create a separately injected migration user with `readWrite` plus `dbAdmin`
+   on only that database, or an equivalent custom role that includes collection
+   creation, index creation, and `collMod`. Collection validators require the
+   additional migration privilege.
+4. Add the API/worker host to the Atlas project IP access list, or configure a
+   private endpoint. The browser and Vercel static web project never connect to
+   MongoDB directly.
+5. Inject the migration credential as `MONGODB_URI`, run `npm run db:migrate`,
+   `npm run db:verify`, and `npm run db:status`, then discard it from the job.
+   Reserved characters in URI credentials must be percent-encoded.
+6. Start API and worker processes with their distinct runtime `MONGODB_URI`
+   values and the same `MONGODB_DATABASE`.
+7. For development only, set `NODE_ENV=development` and
+   `SPLITO_ALLOW_DEVELOPMENT_SEED=true`, then run `npm run db:seed`.
 
-The demo accounts are `alice@splito.example`, `bob@splito.example`, and
-`casey@splito.example`. Their default development-only password is
-`SplitoDemo!2026` unless `SPLITO_DEMO_PASSWORD` is set. The guarded seeder hashes
-it independently with Argon2id; no plaintext or fake hash is stored in Oracle.
-
-The Node scripts dynamically import the official `oracledb` package from the
-workspace. Thin mode is the default and needs no Oracle Client installation.
-See `docs/operations/oracle.md` and `docs/operations/migrations.md` for Windows,
-TLS, least-privilege, backup, and failed-migration procedures.
+Never commit a real URI or password. If a credential appears in chat, logs, a
+ticket, or source control, rotate it before deployment.

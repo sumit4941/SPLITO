@@ -5,6 +5,10 @@ const participantA = '11111111-1111-4111-8111-111111111111';
 const participantB = '22222222-2222-4222-8222-222222222222';
 const groupId = '33333333-3333-4333-8333-333333333333';
 
+function generatedParticipant(index: number): string {
+  return `${index.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
+}
+
 function baseExpense() {
   return {
     groupId,
@@ -70,6 +74,28 @@ describe('expense request allowlists', () => {
         forcePosted: true,
       }).success,
     ).toBe(false);
+  });
+
+  it('caps the combined payer and beneficiary posting fan-out at 100 participants', () => {
+    const beneficiaries = Array.from({ length: 100 }, (_, index) => ({
+      participantId: generatedParticipant(index + 1),
+    }));
+    expect(
+      expenseMutationSchema.safeParse({
+        ...baseExpense(),
+        splitMethod: 'equal',
+        beneficiaries,
+      }).success,
+    ).toBe(false);
+
+    expect(
+      expenseMutationSchema.safeParse({
+        ...baseExpense(),
+        payers: [{ participantId: beneficiaries[0]?.participantId, paidAmountMinor: '10000' }],
+        splitMethod: 'equal',
+        beneficiaries,
+      }).success,
+    ).toBe(true);
   });
 
   it.each([

@@ -1,11 +1,11 @@
 import { Controller, Get } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { OracleService } from '../database/oracle.service.js';
+import { MongoService } from '../database/mongo.service.js';
 
 @ApiTags('health')
 @Controller('health')
 export class HealthController {
-  constructor(private readonly oracle: OracleService) {}
+  constructor(private readonly mongo: MongoService) {}
 
   @Get('live')
   @ApiOperation({ summary: 'Process liveness' })
@@ -14,11 +14,9 @@ export class HealthController {
   }
 
   @Get('ready')
-  @ApiOperation({ summary: 'Oracle-backed readiness' })
-  async ready(): Promise<{
-    status: 'ok';
-    database: { databaseVersion: string; currentSchema: string };
-  }> {
-    return { status: 'ok', database: await this.oracle.ping() };
+  @ApiOperation({ summary: 'MongoDB-backed readiness' })
+  async ready(): Promise<{ status: 'ok' }> {
+    await this.mongo.ping();
+    return { status: 'ok' };
   }
 }

@@ -1,8 +1,7 @@
-import type { Connection } from 'oracledb';
 import { describe, expect, it, vi } from 'vitest';
 import type { ContextAccessRepository } from '../access/context-access.repository.js';
 import type { AuthContext } from '../auth/auth.types.js';
-import type { OracleService } from '../database/oracle.service.js';
+import type { MongoService, MongoUnitOfWork } from '../database/mongo.service.js';
 import type { IdempotencyService } from '../idempotency/idempotency.service.js';
 import type { ExpenseMutationInput } from './expenses.schemas.js';
 import type { ExpensesRepository, LockedExpenseForUpdate } from './expenses.repository.js';
@@ -71,7 +70,7 @@ function harness(
     readonly replay?: ExpenseSummaryResponse;
   } = {},
 ) {
-  const connection = {} as Connection;
+  const connection = {} as MongoUnitOfWork;
   const repository = {
     lockExpenseForUpdate: vi
       .fn()
@@ -111,8 +110,8 @@ function harness(
       ),
     complete: vi.fn().mockResolvedValue(undefined),
   };
-  const oracle = {
-    withTransaction: vi.fn(async (operation: (value: Connection) => Promise<unknown>) =>
+  const mongo = {
+    withTransaction: vi.fn(async (operation: (value: MongoUnitOfWork) => Promise<unknown>) =>
       operation(connection),
     ),
   };
@@ -120,7 +119,7 @@ function harness(
     idempotency,
     repository,
     service: new ExpensesService(
-      oracle as unknown as OracleService,
+      mongo as unknown as MongoService,
       {} as ContextAccessRepository,
       repository as unknown as ExpensesRepository,
       idempotency as unknown as IdempotencyService,
@@ -147,10 +146,19 @@ describe('creator-only expense update service', () => {
       createdBy: { id: creatorId, displayName: 'Alex' },
       canEdit: true,
     });
-    expect(repository.lockExpenseForUpdate).toHaveBeenCalledWith(
+    expect(repository.lockExpenseForUpdate).toHaveBeenNthCalledWith(
+      1,
       expect.anything(),
       expenseId,
       creatorId,
+      false,
+    );
+    expect(repository.lockExpenseForUpdate).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      expenseId,
+      creatorId,
+      true,
     );
     expect(repository.replacePostedExpense).toHaveBeenCalledWith(
       expect.anything(),
@@ -237,6 +245,13 @@ describe('creator-only expense update service', () => {
       }),
     ).resolves.toEqual({ data: replay, replayed: true });
     expect(idempotency.claim).toHaveBeenCalledOnce();
+    expect(repository.lockExpenseForUpdate).toHaveBeenCalledOnce();
+    expect(repository.lockExpenseForUpdate).toHaveBeenCalledWith(
+      expect.anything(),
+      expenseId,
+      creatorId,
+      false,
+    );
     expect(repository.activeParticipants).not.toHaveBeenCalled();
     expect(repository.currentFinancialEffect).not.toHaveBeenCalled();
     expect(repository.replacePostedExpense).not.toHaveBeenCalled();

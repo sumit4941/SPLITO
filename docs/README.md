@@ -18,7 +18,7 @@ production boundary; they do not imply that an unchecked feature is available.
 ## Operations
 
 - [Windows local setup](operations/local-windows.md)
-- [Oracle setup and verification](operations/oracle.md)
+- [MongoDB setup and verification](operations/mongodb.md)
 - [Migrations and forward recovery](operations/migrations.md)
 - [Backup and restore](operations/backup-restore.md)
 - [Deployment](operations/deployment.md)

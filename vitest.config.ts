@@ -2,8 +2,13 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    include: ['apps/**/*.test.ts', 'apps/**/*.spec.ts', 'packages/**/*.test.ts'],
-    exclude: ['**/node_modules/**', '**/dist/**', '**/e2e/**', '**/*.oracle.test.ts'],
+    include: [
+      'apps/**/*.test.ts',
+      'apps/**/*.spec.ts',
+      'packages/**/*.test.ts',
+      'database/**/*.test.mjs',
+    ],
+    exclude: ['**/node_modules/**', '**/dist/**', '**/e2e/**', '**/*.mongodb.test.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html', 'lcov'],

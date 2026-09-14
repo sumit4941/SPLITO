@@ -1,8 +1,7 @@
-import type { Connection } from 'oracledb';
 import { loadEnvironment } from '@splito/config';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../common/api-error.js';
-import type { OracleService } from '../database/oracle.service.js';
+import type { MongoService, MongoUnitOfWork } from '../database/mongo.service.js';
 import type { SmsDeliveryService } from '../sms/sms-delivery.service.js';
 import { mobileOtpHash } from './auth.crypto.js';
 import type { AuthRepository } from './auth.repository.js';
@@ -25,9 +24,9 @@ function createHarness(
     authenticateMobileOtp: vi.fn(),
     ...repositoryOverrides,
   };
-  const oracle = {
-    withTransaction: vi.fn(async (operation: (connection: Connection) => Promise<unknown>) =>
-      operation({} as Connection),
+  const mongo = {
+    withTransaction: vi.fn(async (operation: (work: MongoUnitOfWork) => Promise<unknown>) =>
+      operation({} as MongoUnitOfWork),
     ),
   };
   const developmentConfig = loadEnvironment({
@@ -53,11 +52,11 @@ function createHarness(
   };
   return {
     repository,
-    oracle,
+    mongo,
     sms,
     service: new AuthService(
       repository as unknown as AuthRepository,
-      oracle as unknown as OracleService,
+      mongo as unknown as MongoService,
       config,
       sms as unknown as SmsDeliveryService,
     ),
@@ -155,7 +154,7 @@ describe('mobile OTP authentication service', () => {
   it('commits a failed attempt and returns a generic invalid-or-expired error', async () => {
     const recordFailedMobileOtpAttempt = vi.fn().mockResolvedValue(undefined);
     const lockMobileOtpChallenge = vi.fn().mockResolvedValue({
-      OTP_CHALLENGE_ID: Buffer.alloc(16, 1),
+      OTP_CHALLENGE_ID: challengeId,
       MOBILE_E164: mobileNumber,
       OTP_HASH: mobileOtpHash(otpPepper, challengeId, mobileNumber, '654321'),
       STATUS: 'PENDING',
@@ -187,7 +186,7 @@ describe('mobile OTP authentication service', () => {
   it('persists expiry before returning the same generic verification error', async () => {
     const expireMobileOtp = vi.fn().mockResolvedValue(undefined);
     const lockMobileOtpChallenge = vi.fn().mockResolvedValue({
-      OTP_CHALLENGE_ID: Buffer.alloc(16, 1),
+      OTP_CHALLENGE_ID: challengeId,
       MOBILE_E164: mobileNumber,
       OTP_HASH: mobileOtpHash(otpPepper, challengeId, mobileNumber, '654321'),
       STATUS: 'PENDING',
@@ -217,7 +216,7 @@ describe('mobile OTP authentication service', () => {
 
   it('rejects a replayed challenge without creating another session', async () => {
     const lockMobileOtpChallenge = vi.fn().mockResolvedValue({
-      OTP_CHALLENGE_ID: Buffer.alloc(16, 1),
+      OTP_CHALLENGE_ID: challengeId,
       MOBILE_E164: mobileNumber,
       OTP_HASH: mobileOtpHash(otpPepper, challengeId, mobileNumber, '654321'),
       STATUS: 'VERIFIED',
@@ -258,7 +257,7 @@ describe('mobile OTP authentication service', () => {
       version: '1',
     } as const;
     const lockMobileOtpChallenge = vi.fn().mockResolvedValue({
-      OTP_CHALLENGE_ID: Buffer.alloc(16, 1),
+      OTP_CHALLENGE_ID: challengeId,
       MOBILE_E164: mobileNumber,
       OTP_HASH: mobileOtpHash(otpPepper, challengeId, mobileNumber, otp),
       STATUS: 'PENDING',

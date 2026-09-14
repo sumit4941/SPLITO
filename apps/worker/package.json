@@ -15,12 +15,12 @@
     "pretest": "npm run build --workspace @splito/config",
     "test": "vitest run src/outbox-worker.test.ts",
     "pretest:integration": "npm run build --workspace @splito/config",
-    "test:integration": "node --env-file-if-exists=../../.env ../../node_modules/vitest/vitest.mjs run --config src/vitest.oracle.config.ts",
+    "test:integration": "node --env-file-if-exists=../../.env ../../node_modules/vitest/vitest.mjs run --config src/vitest.mongodb.config.ts",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {
     "@splito/config": "0.1.0",
-    "oracledb": "7.0.1",
+    "mongodb": "7.6.0",
     "pino": "10.3.1"
   }
 }

@@ -6,7 +6,7 @@ import {
 } from '../access/context-access.repository.js';
 import type { AuthContext } from '../auth/auth.types.js';
 import { ApiError } from '../common/api-error.js';
-import { OracleService } from '../database/oracle.service.js';
+import { MongoService } from '../database/mongo.service.js';
 import { ImageProcessor } from './image.processor.js';
 import { MediaRepository } from './media.repository.js';
 import {
@@ -25,7 +25,7 @@ export class MediaService {
   readonly #logger = new Logger(MediaService.name);
 
   constructor(
-    private readonly oracle: OracleService,
+    private readonly mongo: MongoService,
     private readonly access: ContextAccessRepository,
     private readonly repository: MediaRepository,
     private readonly storage: PrivateMediaStorage,
@@ -55,8 +55,8 @@ export class MediaService {
     const storageKey = await this.store(mediaId, 'USER_AVATAR', processed.bytes);
     let previousStorageKey: string | undefined;
     try {
-      previousStorageKey = await this.oracle.withTransaction((connection) =>
-        this.repository.replaceUserAvatar(connection, auth.user.userId, {
+      previousStorageKey = await this.mongo.withTransaction((work) =>
+        this.repository.replaceUserAvatar(work, auth.user.userId, {
           mediaId,
           storageKey,
           processed,
@@ -78,8 +78,8 @@ export class MediaService {
   }
 
   async deleteAvatar(auth: AuthContext, requestId: string): Promise<void> {
-    const storageKey = await this.oracle.withTransaction((connection) =>
-      this.repository.deleteUserAvatar(connection, {
+    const storageKey = await this.mongo.withTransaction((work) =>
+      this.repository.deleteUserAvatar(work, {
         userId: auth.user.userId,
         actorParticipantId: auth.user.participantId,
         actorUserId: auth.user.userId,
@@ -95,13 +95,8 @@ export class MediaService {
     mediaId: string,
     auth: AuthContext,
   ): Promise<MediaDownload> {
-    const media = await this.oracle.withConnection((connection) =>
-      this.repository.findParticipantAvatar(
-        connection,
-        participantId,
-        auth.user.participantId,
-        mediaId,
-      ),
+    const media = await this.mongo.withTransaction((work) =>
+      this.repository.findParticipantAvatar(work, participantId, auth.user.participantId, mediaId),
     );
     return this.download(media);
   }
@@ -113,13 +108,10 @@ export class MediaService {
     requestId: string,
   ): Promise<MediaMutationResult> {
     this.assertUploadAvailable();
-    await this.oracle.withConnection(async (connection) => {
-      const access = await this.access.contextIdForGroup(
-        connection,
-        groupId,
-        auth.user.participantId,
-        { writable: true },
-      );
+    await this.mongo.withConnection(async (work) => {
+      const access = await this.access.contextIdForGroup(work, groupId, auth.user.participantId, {
+        writable: true,
+      });
       this.requireGroupImageManager(access);
     });
 
@@ -128,15 +120,13 @@ export class MediaService {
     const storageKey = await this.store(mediaId, 'GROUP_IMAGE', processed.bytes);
     let previousStorageKey: string | undefined;
     try {
-      previousStorageKey = await this.oracle.withTransaction(async (connection) => {
-        const access = await this.access.contextIdForGroup(
-          connection,
-          groupId,
-          auth.user.participantId,
-          { lock: true, writable: true },
-        );
+      previousStorageKey = await this.mongo.withTransaction(async (work) => {
+        const access = await this.access.contextIdForGroup(work, groupId, auth.user.participantId, {
+          lock: true,
+          writable: true,
+        });
         this.requireGroupImageManager(access);
-        return this.repository.replaceGroupImage(connection, groupId, access.contextId, {
+        return this.repository.replaceGroupImage(work, groupId, access.contextId, {
           mediaId,
           storageKey,
           processed,
@@ -155,15 +145,13 @@ export class MediaService {
   }
 
   async deleteGroupImage(groupId: string, auth: AuthContext, requestId: string): Promise<void> {
-    const storageKey = await this.oracle.withTransaction(async (connection) => {
-      const access = await this.access.contextIdForGroup(
-        connection,
-        groupId,
-        auth.user.participantId,
-        { lock: true, writable: true },
-      );
+    const storageKey = await this.mongo.withTransaction(async (work) => {
+      const access = await this.access.contextIdForGroup(work, groupId, auth.user.participantId, {
+        lock: true,
+        writable: true,
+      });
       this.requireGroupImageManager(access);
-      return this.repository.deleteGroupImage(connection, {
+      return this.repository.deleteGroupImage(work, {
         groupId,
         contextId: access.contextId,
         actorParticipantId: auth.user.participantId,
@@ -176,8 +164,8 @@ export class MediaService {
   }
 
   async groupImage(groupId: string, mediaId: string, auth: AuthContext): Promise<MediaDownload> {
-    const media = await this.oracle.withConnection((connection) =>
-      this.repository.findGroupImage(connection, groupId, auth.user.participantId, mediaId),
+    const media = await this.mongo.withTransaction((work) =>
+      this.repository.findGroupImage(work, groupId, auth.user.participantId, mediaId),
     );
     return this.download(media);
   }

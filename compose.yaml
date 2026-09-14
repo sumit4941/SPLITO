@@ -1,6 +1,44 @@
 name: splito
 
 services:
+  mongo:
+    profiles: ['local-db']
+    image: mongo:8.0.30-noble
+    command: ['mongod', '--replSet', 'rs0', '--bind_ip_all']
+    restart: unless-stopped
+    ports:
+      # The replica-set member advertises localhost:27017 to host-run apps, so
+      # keep this development-only mapping fixed to that address and port.
+      - '127.0.0.1:27017:27017'
+    volumes:
+      - splito-mongodb-data:/data/db
+    healthcheck:
+      test: ['CMD-SHELL', 'mongosh --quiet --eval "if (!db.adminCommand({ ping: 1 }).ok) quit(1)"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+
+  mongo-init:
+    profiles: ['local-db']
+    image: mongo:8.0.30-noble
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command:
+      [
+        'mongosh',
+        'mongodb://mongo:27017/admin',
+        '--quiet',
+        '--eval',
+        "try { rs.status() } catch (error) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]}) }; for (let attempt = 0; attempt < 60; attempt += 1) { if (db.hello().isWritablePrimary) quit(0); sleep(500) }; quit(1)",
+      ]
+    restart: 'no'
+    security_opt:
+      - no-new-privileges:true
+
   api:
     build:
       context: .
@@ -14,15 +52,13 @@ services:
       WEB_ORIGIN: ${SPLITO_WEB_ORIGIN:?Set SPLITO_WEB_ORIGIN to the exact web origin}
       TRUST_PROXY: 'true'
       COOKIE_SECURE: '${COOKIE_SECURE:-true}'
-      DATABASE_CONNECT_STRING: ${DATABASE_CONNECT_STRING:?Set DATABASE_CONNECT_STRING to external Oracle FREEPDB1}
-      DATABASE_USER: ${DATABASE_USER:-SPLITO_APP}
-      DATABASE_OWNER_SCHEMA: ${DATABASE_OWNER_SCHEMA:-SPLITO_OWNER}
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD:?Set DATABASE_PASSWORD}
-      DATABASE_POOL_MIN: ${DATABASE_POOL_MIN:-1}
-      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-8}
-      DATABASE_POOL_INCREMENT: ${DATABASE_POOL_INCREMENT:-1}
-      DATABASE_QUEUE_TIMEOUT_MS: ${DATABASE_QUEUE_TIMEOUT_MS:-5000}
-      DATABASE_CALL_TIMEOUT_MS: ${DATABASE_CALL_TIMEOUT_MS:-15000}
+      MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI to the external MongoDB replica set}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-splito}
+      MONGODB_MIN_POOL_SIZE: ${MONGODB_MIN_POOL_SIZE:-1}
+      MONGODB_MAX_POOL_SIZE: ${MONGODB_MAX_POOL_SIZE:-10}
+      MONGODB_CONNECT_TIMEOUT_MS: ${MONGODB_CONNECT_TIMEOUT_MS:-10000}
+      MONGODB_SERVER_SELECTION_TIMEOUT_MS: ${MONGODB_SERVER_SELECTION_TIMEOUT_MS:-10000}
+      MONGODB_SOCKET_TIMEOUT_MS: ${MONGODB_SOCKET_TIMEOUT_MS:-30000}
       SESSION_PEPPER: ${SESSION_PEPPER:?Set SESSION_PEPPER}
       CSRF_SECRET: ${CSRF_SECRET:?Set CSRF_SECRET}
       OTP_PEPPER: ${OTP_PEPPER:?Set OTP_PEPPER}
@@ -57,15 +93,13 @@ services:
     environment:
       NODE_ENV: ${NODE_ENV:-production}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      DATABASE_CONNECT_STRING: ${DATABASE_CONNECT_STRING:?Set DATABASE_CONNECT_STRING to external Oracle FREEPDB1}
-      DATABASE_USER: ${DATABASE_USER:-SPLITO_APP}
-      DATABASE_OWNER_SCHEMA: ${DATABASE_OWNER_SCHEMA:-SPLITO_OWNER}
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD:?Set DATABASE_PASSWORD}
-      DATABASE_POOL_MIN: ${DATABASE_POOL_MIN:-1}
-      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-8}
-      DATABASE_POOL_INCREMENT: ${DATABASE_POOL_INCREMENT:-1}
-      DATABASE_QUEUE_TIMEOUT_MS: ${DATABASE_QUEUE_TIMEOUT_MS:-5000}
-      DATABASE_CALL_TIMEOUT_MS: ${DATABASE_CALL_TIMEOUT_MS:-15000}
+      MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI to the external MongoDB replica set}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-splito}
+      MONGODB_MIN_POOL_SIZE: ${MONGODB_MIN_POOL_SIZE:-1}
+      MONGODB_MAX_POOL_SIZE: ${MONGODB_MAX_POOL_SIZE:-10}
+      MONGODB_CONNECT_TIMEOUT_MS: ${MONGODB_CONNECT_TIMEOUT_MS:-10000}
+      MONGODB_SERVER_SELECTION_TIMEOUT_MS: ${MONGODB_SERVER_SELECTION_TIMEOUT_MS:-10000}
+      MONGODB_SOCKET_TIMEOUT_MS: ${MONGODB_SOCKET_TIMEOUT_MS:-30000}
       OUTBOX_POLL_MS: ${OUTBOX_POLL_MS:-1000}
       OUTBOX_LEASE_SECONDS: ${OUTBOX_LEASE_SECONDS:-60}
       OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-10}
@@ -98,13 +132,13 @@ services:
       context: .
       dockerfile: deploy/docker/Dockerfile.api
     environment:
-      SPLITO_MIGRATION_DB_CONNECT_STRING: ${SPLITO_MIGRATION_DB_CONNECT_STRING:?Set migration connect string}
-      SPLITO_MIGRATION_DB_USER: ${SPLITO_MIGRATION_DB_USER:-SPLITO_OWNER}
-      SPLITO_MIGRATION_DB_PASSWORD: ${SPLITO_MIGRATION_DB_PASSWORD:?Set migration password}
-      SPLITO_MIGRATION_LOCK_TIMEOUT_SECONDS: ${SPLITO_MIGRATION_LOCK_TIMEOUT_SECONDS:-60}
-      SPLITO_MIGRATION_LEASE_SECONDS: ${SPLITO_MIGRATION_LEASE_SECONDS:-600}
-      SPLITO_MIGRATION_CALL_TIMEOUT_MS: ${SPLITO_MIGRATION_CALL_TIMEOUT_MS:-120000}
-      SPLITO_ORACLE_MODE: thin
+      MONGODB_URI: ${MONGODB_URI:?Set MONGODB_URI to the external MongoDB replica set}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-splito}
+      MONGODB_MIN_POOL_SIZE: ${MONGODB_MIN_POOL_SIZE:-1}
+      MONGODB_MAX_POOL_SIZE: ${MONGODB_MAX_POOL_SIZE:-10}
+      MONGODB_CONNECT_TIMEOUT_MS: ${MONGODB_CONNECT_TIMEOUT_MS:-10000}
+      MONGODB_SERVER_SELECTION_TIMEOUT_MS: ${MONGODB_SERVER_SELECTION_TIMEOUT_MS:-10000}
+      MONGODB_SOCKET_TIMEOUT_MS: ${MONGODB_SOCKET_TIMEOUT_MS:-30000}
     command: ['node', 'database/scripts/migrate.mjs']
     read_only: true
     tmpfs:
@@ -113,4 +147,5 @@ services:
       - no-new-privileges:true
 
 volumes:
+  splito-mongodb-data:
   splito-private-storage:

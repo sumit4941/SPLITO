@@ -2,9 +2,9 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    include: ['src/**/*.oracle.test.ts'],
-    testTimeout: 30_000,
-    hookTimeout: 30_000,
+    include: ['src/**/*.mongodb.test.ts'],
+    testTimeout: 45_000,
+    hookTimeout: 45_000,
     fileParallelism: false,
   },
 });

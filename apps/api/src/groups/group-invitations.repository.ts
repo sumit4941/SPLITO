@@ -1,76 +1,104 @@
 import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
-import type { Connection } from 'oracledb';
 import { ApiError } from '../common/api-error.js';
-import { OracleService } from '../database/oracle.service.js';
-import { rawToUuid, uuidToRaw } from '../database/uuid.js';
+import {
+  COLLECTIONS,
+  MongoService,
+  mongoOptions,
+  type MongoUnitOfWork,
+} from '../database/mongo.service.js';
 import { participantAvatarUrl } from '../media/media.types.js';
 import type { GroupMember } from './groups.repository.js';
 
-interface ManagedGroupRow {
-  CONTEXT_ID: Buffer;
-  GROUP_ID: Buffer;
-  GROUP_NAME: string;
-  CONTEXT_STATUS: 'ACTIVE' | 'ARCHIVED';
-  MEMBER_ROLE: 'OWNER' | 'ADMIN' | 'MEMBER';
+type AccountStatus = 'PENDING' | 'ACTIVE' | 'LOCKED' | 'DELETION_PENDING' | 'ANONYMIZED';
+type MemberRole = 'OWNER' | 'ADMIN' | 'MEMBER';
+
+interface ContextDocument {
+  _id: string;
+  status: 'ACTIVE' | 'ARCHIVED';
+  mutationVersion: number;
+  updatedAt: Date;
 }
 
-interface RegisteredTargetRow {
-  USER_ID: Buffer;
-  PARTICIPANT_ID: Buffer;
-  DISPLAY_NAME: string;
-  STATUS: 'PENDING' | 'ACTIVE' | 'LOCKED' | 'DELETION_PENDING' | 'ANONYMIZED';
-  VERIFIED_FLAG: 'Y' | 'N';
-  AVATAR_MEDIA_ID: Buffer | null;
+interface GroupDocument {
+  _id: string;
+  contextId: string;
+  name: string;
 }
 
-interface ActiveMemberRow {
-  MEMBER_ROLE: 'OWNER' | 'ADMIN' | 'MEMBER';
-  ALLOCATION_ORDER: string;
+interface UserDocument {
+  _id: string;
+  mobileE164?: string;
+  mobileVerifiedAt?: Date;
+  status: AccountStatus;
+  avatarKey?: string;
 }
 
-interface PendingInvitationRow {
-  INVITATION_ID: Buffer;
-  RESEND_COUNT: string;
-  EXPIRED_FLAG: 'Y' | 'N';
+interface ParticipantDocument {
+  _id: string;
+  userId?: string;
+  kind: 'USER' | 'GUEST';
+  displayName: string;
 }
 
-interface InvitationPreviewRow {
-  INVITATION_ID: Buffer;
-  CONTEXT_ID: Buffer;
-  GROUP_ID: Buffer;
-  GROUP_NAME: string;
-  INVITER_DISPLAY_NAME: string;
-  EXPIRES_AT_TEXT: string;
+interface ContextMemberDocument {
+  _id: string;
+  contextId: string;
+  participantId: string;
+  role: MemberRole;
+  status: 'ACTIVE' | 'FORMER';
+  allocationOrder: number;
+  addedByParticipantId: string;
+  joinedAt: Date;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
-interface InvitationLocatorRow {
-  INVITATION_ID: Buffer;
-  CONTEXT_ID: Buffer;
+interface InvitationDocument {
+  _id: string;
+  invitationType: 'GROUP';
+  contextId: string;
+  inviterParticipantId: string;
+  inviteeMobileE164: string;
+  inviteeParticipantId?: string;
+  tokenHash: Buffer;
+  status: 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'REVOKED' | 'EXPIRED';
+  expiresAt: Date;
+  resendCount: number;
+  respondedAt?: Date;
+  revokedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
-interface LockedInvitationRow extends InvitationPreviewRow {
-  INVITER_PARTICIPANT_ID: Buffer;
-  INVITEE_PARTICIPANT_ID: Buffer | null;
-  STATUS: 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'REVOKED' | 'EXPIRED';
-  EXPIRED_FLAG: 'Y' | 'N';
-  INVITER_AUTHORIZED_FLAG: 'Y' | 'N';
+interface MediaDocument {
+  _id: string;
+  ownerUserId?: string;
+  storageKey: string;
+  mediaKind: 'USER_AVATAR' | 'GROUP_IMAGE';
+  status: 'ACTIVE' | 'SUPERSEDED' | 'DELETED';
+}
+
+interface EventDocument {
+  _id: string;
+  [key: string]: unknown;
 }
 
 export interface ManagedGroup {
   readonly contextId: string;
   readonly groupId: string;
   readonly groupName: string;
-  readonly status: ManagedGroupRow['CONTEXT_STATUS'];
-  readonly callerRole: ManagedGroupRow['MEMBER_ROLE'];
+  readonly status: ContextDocument['status'];
+  readonly callerRole: MemberRole;
 }
 
 export interface RegisteredTarget {
   readonly userId: string;
   readonly participantId: string;
   readonly displayName: string;
-  readonly status: RegisteredTargetRow['STATUS'];
+  readonly status: AccountStatus;
   readonly mobileVerified: boolean;
+  readonly mobileNumber?: string;
   readonly avatarUrl?: string;
 }
 
@@ -82,83 +110,81 @@ export interface InvitationPreview {
   readonly expiresAt: string;
 }
 
-const invitationTimestamp = `TO_CHAR(I.EXPIRES_AT_UTC, 'YYYY-MM-DD"T"HH24:MI:SS.FF6"Z"')`;
-
 @Injectable()
 export class GroupInvitationsRepository {
-  constructor(private readonly oracle: OracleService) {}
+  constructor(private readonly mongo: MongoService) {}
 
   async lockManagedGroup(
-    connection: Connection,
+    work: MongoUnitOfWork,
     groupId: string,
     callerParticipantId: string,
   ): Promise<ManagedGroup | undefined> {
-    const result = await this.oracle.execute<ManagedGroupRow>(
-      connection,
-      `SELECT C.CONTEXT_ID, G.GROUP_ID, G.GROUP_NAME,
-              C.STATUS AS CONTEXT_STATUS, CALLER_M.MEMBER_ROLE
-         FROM SPLITO_GROUPS G
-         JOIN SPLITO_CONTEXTS C ON C.CONTEXT_ID = G.CONTEXT_ID
-         JOIN SPLITO_CONTEXT_MEMBERS CALLER_M
-           ON CALLER_M.CONTEXT_ID = C.CONTEXT_ID
-          AND CALLER_M.PARTICIPANT_ID = :callerParticipantId
-          AND CALLER_M.STATUS = 'ACTIVE'
-        WHERE G.GROUP_ID = :groupId
-        FOR UPDATE OF C.STATUS, CALLER_M.STATUS`,
-      {
-        groupId: uuidToRaw(groupId),
-        callerParticipantId: uuidToRaw(callerParticipantId),
-      },
-    );
-    const row = result.rows?.[0];
-    return row
+    const options = mongoOptions(work);
+    const group = await work.db
+      .collection<GroupDocument>(COLLECTIONS.groups)
+      .findOne({ _id: groupId.toLowerCase() }, options);
+    if (!group) return undefined;
+    const context = await work.db
+      .collection<ContextDocument>(COLLECTIONS.contexts)
+      .findOne({ _id: group.contextId }, options);
+    const membership = await work.db
+      .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+      .findOne(
+        {
+          contextId: group.contextId,
+          participantId: callerParticipantId.toLowerCase(),
+          status: 'ACTIVE',
+        },
+        options,
+      );
+    return context && membership
       ? {
-          contextId: rawToUuid(row.CONTEXT_ID),
-          groupId: rawToUuid(row.GROUP_ID),
-          groupName: row.GROUP_NAME,
-          status: row.CONTEXT_STATUS,
-          callerRole: row.MEMBER_ROLE,
+          contextId: context._id,
+          groupId: group._id,
+          groupName: group.name,
+          status: context.status,
+          callerRole: membership.role,
         }
       : undefined;
   }
 
   async findRegisteredTarget(
-    connection: Connection,
+    work: MongoUnitOfWork,
     mobileNumber: string,
   ): Promise<RegisteredTarget | undefined> {
-    const result = await this.oracle.execute<RegisteredTargetRow>(
-      connection,
-      `SELECT U.USER_ID, P.PARTICIPANT_ID, P.DISPLAY_NAME, U.STATUS,
-              CASE WHEN U.MOBILE_VERIFIED_AT_UTC IS NULL THEN 'N' ELSE 'Y' END AS VERIFIED_FLAG,
-              AVATAR.MEDIA_ID AS AVATAR_MEDIA_ID
-         FROM SPLITO_USERS U
-         JOIN SPLITO_PARTICIPANTS P ON P.USER_ID = U.USER_ID AND P.KIND = 'USER'
-         LEFT JOIN SPLITO_MEDIA_OBJECTS AVATAR
-           ON AVATAR.OWNER_USER_ID = U.USER_ID
-          AND AVATAR.STORAGE_KEY = U.AVATAR_KEY
-          AND AVATAR.MEDIA_KIND = 'USER_AVATAR'
-          AND AVATAR.STATUS = 'ACTIVE'
-        WHERE U.MOBILE_E164 = :mobileNumber
-        FOR UPDATE OF U.STATUS`,
-      { mobileNumber },
-    );
-    const row = result.rows?.[0];
-    if (!row) return undefined;
-    const participantId = rawToUuid(row.PARTICIPANT_ID);
+    const options = mongoOptions(work);
+    const user = await work.db
+      .collection<UserDocument>(COLLECTIONS.users)
+      .findOne({ mobileE164: mobileNumber }, options);
+    if (!user) return undefined;
+    const participant = await work.db
+      .collection<ParticipantDocument>(COLLECTIONS.participants)
+      .findOne({ userId: user._id, kind: 'USER' }, options);
+    if (!participant) return undefined;
+    const avatar = user.avatarKey
+      ? await work.db.collection<MediaDocument>(COLLECTIONS.mediaObjects).findOne(
+          {
+            ownerUserId: user._id,
+            storageKey: user.avatarKey,
+            mediaKind: 'USER_AVATAR',
+            status: 'ACTIVE',
+          },
+          options,
+        )
+      : undefined;
     return {
-      userId: rawToUuid(row.USER_ID),
-      participantId,
-      displayName: row.DISPLAY_NAME,
-      status: row.STATUS,
-      mobileVerified: row.VERIFIED_FLAG === 'Y',
-      ...(row.AVATAR_MEDIA_ID
-        ? { avatarUrl: participantAvatarUrl(participantId, rawToUuid(row.AVATAR_MEDIA_ID)) }
-        : {}),
+      userId: user._id,
+      participantId: participant._id,
+      displayName: participant.displayName,
+      status: user.status,
+      mobileVerified: Boolean(user.mobileVerifiedAt),
+      ...(user.mobileE164 ? { mobileNumber: user.mobileE164 } : {}),
+      ...(avatar ? { avatarUrl: participantAvatarUrl(participant._id, avatar._id) } : {}),
     };
   }
 
   async ensureRegisteredMember(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly group: ManagedGroup;
       readonly target: RegisteredTarget;
@@ -167,67 +193,54 @@ export class GroupInvitationsRepository {
       readonly requestId: string;
     },
   ): Promise<{ readonly member: GroupMember; readonly created: boolean }> {
-    const activeResult = await this.oracle.execute<ActiveMemberRow>(
-      connection,
-      `SELECT MEMBER_ROLE, TO_CHAR(ALLOCATION_ORDER) AS ALLOCATION_ORDER
-         FROM SPLITO_CONTEXT_MEMBERS
-        WHERE CONTEXT_ID = :contextId
-          AND PARTICIPANT_ID = :participantId
-          AND STATUS = 'ACTIVE'
-        FOR UPDATE`,
+    const options = mongoOptions(work);
+    const members = work.db.collection<ContextMemberDocument>(COLLECTIONS.contextMembers);
+    const existing = await members.findOne(
       {
-        contextId: uuidToRaw(values.group.contextId),
-        participantId: uuidToRaw(values.target.participantId),
+        contextId: values.group.contextId,
+        participantId: values.target.participantId,
+        status: 'ACTIVE',
       },
+      options,
     );
-    const existing = activeResult.rows?.[0];
     if (existing) {
       await this.revokePendingInvitations(
-        connection,
+        work,
         values.group.contextId,
         values.target.participantId,
       );
       return {
-        member: this.memberResponse(values.target, existing.MEMBER_ROLE, existing.ALLOCATION_ORDER),
+        member: this.memberResponse(values.target, existing.role, existing.allocationOrder),
         created: false,
       };
     }
 
-    const orderResult = await this.oracle.execute<{ NEXT_ORDER: string }>(
-      connection,
-      `SELECT TO_CHAR(NVL(MAX(ALLOCATION_ORDER), -1) + 1) AS NEXT_ORDER
-         FROM SPLITO_CONTEXT_MEMBERS
-        WHERE CONTEXT_ID = :contextId`,
-      { contextId: uuidToRaw(values.group.contextId) },
-    );
-    const allocationOrder = orderResult.rows?.[0]?.NEXT_ORDER;
-    if (allocationOrder === undefined) throw new Error('Oracle did not return a membership order');
-
+    await this.bumpContextVersion(work, values.group.contextId);
+    const lastMember = await members
+      .find({ contextId: values.group.contextId }, options)
+      .sort({ allocationOrder: -1, _id: -1 })
+      .limit(1)
+      .next();
+    const allocationOrder = (lastMember?.allocationOrder ?? -1) + 1;
     const membershipId = randomUUID();
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_CONTEXT_MEMBERS (
-         MEMBERSHIP_ID, CONTEXT_ID, PARTICIPANT_ID, MEMBER_ROLE,
-         ALLOCATION_ORDER, ADDED_BY_PARTICIPANT_ID
-       ) VALUES (
-         :membershipId, :contextId, :participantId, 'MEMBER',
-         :allocationOrder, :actorParticipantId
-       )`,
+    const now = new Date();
+    await members.insertOne(
       {
-        membershipId: uuidToRaw(membershipId),
-        contextId: uuidToRaw(values.group.contextId),
-        participantId: uuidToRaw(values.target.participantId),
+        _id: membershipId,
+        contextId: values.group.contextId,
+        participantId: values.target.participantId,
+        role: 'MEMBER',
+        status: 'ACTIVE',
         allocationOrder,
-        actorParticipantId: uuidToRaw(values.actorParticipantId),
+        addedByParticipantId: values.actorParticipantId,
+        joinedAt: now,
+        createdAt: now,
+        updatedAt: now,
       },
+      options,
     );
-    await this.bumpContextVersion(connection, values.group.contextId);
-    await this.revokePendingInvitations(
-      connection,
-      values.group.contextId,
-      values.target.participantId,
-    );
-    await this.insertOutbox(connection, {
+    await this.revokePendingInvitations(work, values.group.contextId, values.target.participantId);
+    await this.insertOutbox(work, {
       eventType: 'group.member.added',
       aggregateType: 'GROUP',
       aggregateId: values.group.groupId,
@@ -238,7 +251,7 @@ export class GroupInvitationsRepository {
         participantId: values.target.participantId,
       },
     });
-    await this.insertAudit(connection, {
+    await this.insertAudit(work, {
       actorParticipantId: values.actorParticipantId,
       actorUserId: values.actorUserId,
       actionKey: 'group.member.add',
@@ -255,7 +268,7 @@ export class GroupInvitationsRepository {
   }
 
   async issueInvitation(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly group: ManagedGroup;
       readonly mobileNumber: string;
@@ -266,32 +279,21 @@ export class GroupInvitationsRepository {
       readonly requestId: string;
     },
   ): Promise<{ readonly invitationId: string; readonly resend: boolean }> {
-    const pendingResult = await this.oracle.execute<PendingInvitationRow>(
-      connection,
-      `SELECT INVITATION_ID, TO_CHAR(RESEND_COUNT) AS RESEND_COUNT,
-              CASE WHEN EXPIRES_AT_UTC <= SYS_EXTRACT_UTC(SYSTIMESTAMP) THEN 'Y' ELSE 'N' END
-                AS EXPIRED_FLAG
-         FROM SPLITO_INVITATIONS
-        WHERE INVITATION_TYPE = 'GROUP'
-          AND CONTEXT_ID = :contextId
-          AND INVITEE_MOBILE_E164 = :mobileNumber
-          AND STATUS = 'PENDING'
-        FOR UPDATE`,
-      { contextId: uuidToRaw(values.group.contextId), mobileNumber: values.mobileNumber },
+    const options = mongoOptions(work);
+    const invitations = work.db.collection<InvitationDocument>(COLLECTIONS.invitations);
+    await this.bumpContextVersion(work, values.group.contextId);
+    const now = new Date();
+    const pending = await invitations.findOne(
+      {
+        invitationType: 'GROUP',
+        contextId: values.group.contextId,
+        inviteeMobileE164: values.mobileNumber,
+        status: 'PENDING',
+      },
+      options,
     );
-    let pending = pendingResult.rows?.[0];
-    if (pending?.EXPIRED_FLAG === 'Y') {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_INVITATIONS
-            SET STATUS = 'EXPIRED', RESPONDED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-          WHERE INVITATION_ID = :invitationId AND STATUS = 'PENDING'`,
-        { invitationId: pending.INVITATION_ID },
-      );
-      pending = undefined;
-    }
-
-    if (pending && Number(pending.RESEND_COUNT) >= 5) {
+    const renewExpired = Boolean(pending && pending.expiresAt <= now);
+    if (pending && !renewExpired && pending.resendCount >= 5) {
       throw new ApiError(
         429,
         'INVITATION_RESEND_LIMIT',
@@ -299,119 +301,105 @@ export class GroupInvitationsRepository {
       );
     }
 
-    const invitationId = pending ? rawToUuid(pending.INVITATION_ID) : randomUUID();
+    const invitationId = pending?._id ?? randomUUID();
     if (pending) {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_INVITATIONS
-            SET INVITER_PARTICIPANT_ID = :actorParticipantId,
-                TOKEN_HASH = :tokenHash,
-                EXPIRES_AT_UTC = :expiresAt,
-                RESEND_COUNT = RESEND_COUNT + 1
-          WHERE INVITATION_ID = :invitationId
-            AND STATUS = 'PENDING'`,
+      const updated = await invitations.updateOne(
+        { _id: pending._id, status: 'PENDING' },
         {
-          actorParticipantId: uuidToRaw(values.actorParticipantId),
-          tokenHash: values.tokenHash,
-          expiresAt: values.expiresAt,
-          invitationId: pending.INVITATION_ID,
+          $set: {
+            inviterParticipantId: values.actorParticipantId,
+            tokenHash: Buffer.from(values.tokenHash),
+            expiresAt: values.expiresAt,
+            updatedAt: now,
+            ...(renewExpired ? { status: 'PENDING' as const, resendCount: 0 } : {}),
+          },
+          ...(!renewExpired ? { $inc: { resendCount: 1 } } : {}),
+          ...(renewExpired ? { $unset: { respondedAt: '', revokedAt: '' } } : {}),
         },
+        options,
       );
+      if (updated.modifiedCount !== 1) throw new Error('Invitation resend was not persisted');
     } else {
-      await this.oracle.execute(
-        connection,
-        `INSERT INTO SPLITO_INVITATIONS (
-           INVITATION_ID, INVITATION_TYPE, CONTEXT_ID, INVITER_PARTICIPANT_ID,
-           INVITEE_MOBILE_E164, TOKEN_HASH, EXPIRES_AT_UTC
-         ) VALUES (
-           :invitationId, 'GROUP', :contextId, :actorParticipantId,
-           :mobileNumber, :tokenHash, :expiresAt
-         )`,
+      await invitations.insertOne(
         {
-          invitationId: uuidToRaw(invitationId),
-          contextId: uuidToRaw(values.group.contextId),
-          actorParticipantId: uuidToRaw(values.actorParticipantId),
-          mobileNumber: values.mobileNumber,
-          tokenHash: values.tokenHash,
+          _id: invitationId,
+          invitationType: 'GROUP',
+          contextId: values.group.contextId,
+          inviterParticipantId: values.actorParticipantId,
+          inviteeMobileE164: values.mobileNumber,
+          tokenHash: Buffer.from(values.tokenHash),
+          status: 'PENDING',
           expiresAt: values.expiresAt,
+          resendCount: 0,
+          createdAt: now,
+          updatedAt: now,
         },
+        options,
       );
     }
-
-    await this.insertOutbox(connection, {
+    await this.insertOutbox(work, {
       eventType: 'group.invitation.requested',
       aggregateType: 'INVITATION',
       aggregateId: invitationId,
       payload: { invitationId, groupId: values.group.groupId },
     });
-    await this.insertAudit(connection, {
+    await this.insertAudit(work, {
       actorParticipantId: values.actorParticipantId,
       actorUserId: values.actorUserId,
-      actionKey: pending ? 'group.invitation.resend' : 'group.invitation.create',
+      actionKey: pending && !renewExpired ? 'group.invitation.resend' : 'group.invitation.create',
       resourceType: 'INVITATION',
       resourceId: invitationId,
       contextId: values.group.contextId,
       requestId: values.requestId,
       metadata: { deliveryChannel: 'sms' },
     });
-    return { invitationId, resend: Boolean(pending) };
+    return { invitationId, resend: Boolean(pending && !renewExpired) };
   }
 
   async preview(
-    connection: Connection,
+    work: MongoUnitOfWork,
     tokenHash: Buffer,
     mobileNumber: string,
   ): Promise<InvitationPreview | undefined> {
-    const result = await this.oracle.execute<InvitationPreviewRow>(
-      connection,
-      `SELECT I.INVITATION_ID, I.CONTEXT_ID, G.GROUP_ID, G.GROUP_NAME,
-              INVITER.DISPLAY_NAME AS INVITER_DISPLAY_NAME,
-              ${invitationTimestamp} AS EXPIRES_AT_TEXT
-         FROM SPLITO_INVITATIONS I
-         JOIN SPLITO_CONTEXTS C ON C.CONTEXT_ID = I.CONTEXT_ID AND C.STATUS = 'ACTIVE'
-         JOIN SPLITO_GROUPS G ON G.CONTEXT_ID = I.CONTEXT_ID
-         JOIN SPLITO_PARTICIPANTS INVITER
-           ON INVITER.PARTICIPANT_ID = I.INVITER_PARTICIPANT_ID
-        WHERE I.INVITATION_TYPE = 'GROUP'
-          AND I.TOKEN_HASH = :tokenHash
-          AND I.INVITEE_MOBILE_E164 = :mobileNumber
-          AND I.STATUS = 'PENDING'
-          AND I.EXPIRES_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-          AND EXISTS (
-            SELECT 1 FROM SPLITO_CONTEXT_MEMBERS INVITER_M
-             WHERE INVITER_M.CONTEXT_ID = I.CONTEXT_ID
-               AND INVITER_M.PARTICIPANT_ID = I.INVITER_PARTICIPANT_ID
-               AND INVITER_M.STATUS = 'ACTIVE'
-               AND INVITER_M.MEMBER_ROLE IN ('OWNER', 'ADMIN')
-          )`,
-      { tokenHash, mobileNumber },
-    );
-    return this.mapPreview(result.rows?.[0]);
+    const invitation = await work.db
+      .collection<InvitationDocument>(COLLECTIONS.invitations)
+      .findOne(
+        {
+          invitationType: 'GROUP',
+          tokenHash,
+          inviteeMobileE164: mobileNumber,
+          status: 'PENDING',
+          expiresAt: { $gt: new Date() },
+        },
+        mongoOptions(work),
+      );
+    if (!invitation) return undefined;
+    return this.previewForInvitation(work, invitation);
   }
 
   async invitationLocator(
-    connection: Connection,
+    work: MongoUnitOfWork,
     tokenHash: Buffer,
     mobileNumber: string,
   ): Promise<{ readonly invitationId: string; readonly contextId: string } | undefined> {
-    const result = await this.oracle.execute<InvitationLocatorRow>(
-      connection,
-      `SELECT INVITATION_ID, CONTEXT_ID
-         FROM SPLITO_INVITATIONS
-        WHERE INVITATION_TYPE = 'GROUP'
-          AND TOKEN_HASH = :tokenHash
-          AND INVITEE_MOBILE_E164 = :mobileNumber
-          AND STATUS IN ('PENDING', 'ACCEPTED')`,
-      { tokenHash, mobileNumber },
-    );
-    const row = result.rows?.[0];
-    return row
-      ? { invitationId: rawToUuid(row.INVITATION_ID), contextId: rawToUuid(row.CONTEXT_ID) }
+    const invitation = await work.db
+      .collection<InvitationDocument>(COLLECTIONS.invitations)
+      .findOne(
+        {
+          invitationType: 'GROUP',
+          tokenHash,
+          inviteeMobileE164: mobileNumber,
+          status: { $in: ['PENDING', 'ACCEPTED'] },
+        },
+        { ...mongoOptions(work), projection: { _id: 1, contextId: 1 } },
+      );
+    return invitation
+      ? { invitationId: invitation._id, contextId: invitation.contextId }
       : undefined;
   }
 
   async accept(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly locator: { readonly invitationId: string; readonly contextId: string };
       readonly tokenHash: Buffer;
@@ -421,221 +409,241 @@ export class GroupInvitationsRepository {
       readonly requestId: string;
     },
   ): Promise<{ readonly preview: InvitationPreview; readonly member: GroupMember } | undefined> {
-    const contextLock = await this.oracle.execute<{ CONTEXT_ID: Buffer }>(
-      connection,
-      `SELECT C.CONTEXT_ID
-         FROM SPLITO_CONTEXTS C
-         JOIN SPLITO_GROUPS G ON G.CONTEXT_ID = C.CONTEXT_ID
-        WHERE C.CONTEXT_ID = :contextId
-          AND C.STATUS = 'ACTIVE'
-        FOR UPDATE OF C.STATUS`,
-      { contextId: uuidToRaw(values.locator.contextId) },
-    );
-    if (!contextLock.rows?.[0]) return undefined;
-
-    const invitationResult = await this.oracle.execute<LockedInvitationRow>(
-      connection,
-      `SELECT I.INVITATION_ID, I.CONTEXT_ID, I.INVITER_PARTICIPANT_ID,
-              I.INVITEE_PARTICIPANT_ID, I.STATUS,
-              G.GROUP_ID, G.GROUP_NAME, INVITER.DISPLAY_NAME AS INVITER_DISPLAY_NAME,
-              ${invitationTimestamp} AS EXPIRES_AT_TEXT,
-              CASE WHEN I.EXPIRES_AT_UTC <= SYS_EXTRACT_UTC(SYSTIMESTAMP) THEN 'Y' ELSE 'N' END
-                AS EXPIRED_FLAG,
-              CASE WHEN EXISTS (
-                SELECT 1 FROM SPLITO_CONTEXT_MEMBERS INVITER_M
-                 WHERE INVITER_M.CONTEXT_ID = I.CONTEXT_ID
-                   AND INVITER_M.PARTICIPANT_ID = I.INVITER_PARTICIPANT_ID
-                   AND INVITER_M.STATUS = 'ACTIVE'
-                   AND INVITER_M.MEMBER_ROLE IN ('OWNER', 'ADMIN')
-              ) THEN 'Y' ELSE 'N' END AS INVITER_AUTHORIZED_FLAG
-         FROM SPLITO_INVITATIONS I
-         JOIN SPLITO_GROUPS G ON G.CONTEXT_ID = I.CONTEXT_ID
-         JOIN SPLITO_PARTICIPANTS INVITER
-           ON INVITER.PARTICIPANT_ID = I.INVITER_PARTICIPANT_ID
-        WHERE I.INVITATION_ID = :invitationId
-          AND I.CONTEXT_ID = :contextId
-          AND I.INVITATION_TYPE = 'GROUP'
-          AND I.TOKEN_HASH = :tokenHash
-          AND I.INVITEE_MOBILE_E164 = :mobileNumber
-          AND I.STATUS IN ('PENDING', 'ACCEPTED')
-        FOR UPDATE OF I.STATUS`,
-      {
-        invitationId: uuidToRaw(values.locator.invitationId),
-        contextId: uuidToRaw(values.locator.contextId),
-        tokenHash: values.tokenHash,
-        mobileNumber: values.mobileNumber,
-      },
-    );
-    const invitation = invitationResult.rows?.[0];
-    if (!invitation) return undefined;
-    if (
-      invitation.STATUS === 'PENDING' &&
-      (invitation.EXPIRED_FLAG === 'Y' || invitation.INVITER_AUTHORIZED_FLAG !== 'Y')
-    ) {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_INVITATIONS
-            SET STATUS = :status,
-                RESPONDED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-                REVOKED_AT_UTC = CASE WHEN :status = 'REVOKED'
-                  THEN SYS_EXTRACT_UTC(SYSTIMESTAMP) ELSE NULL END
-          WHERE INVITATION_ID = :invitationId AND STATUS = 'PENDING'`,
+    const options = mongoOptions(work);
+    const context = await work.db
+      .collection<ContextDocument>(COLLECTIONS.contexts)
+      .findOne({ _id: values.locator.contextId, status: 'ACTIVE' }, options);
+    const group = await work.db
+      .collection<GroupDocument>(COLLECTIONS.groups)
+      .findOne({ contextId: values.locator.contextId }, options);
+    const invitation = await work.db
+      .collection<InvitationDocument>(COLLECTIONS.invitations)
+      .findOne(
         {
-          invitationId: invitation.INVITATION_ID,
-          status: invitation.EXPIRED_FLAG === 'Y' ? 'EXPIRED' : 'REVOKED',
+          _id: values.locator.invitationId,
+          contextId: values.locator.contextId,
+          invitationType: 'GROUP',
+          tokenHash: values.tokenHash,
+          inviteeMobileE164: values.mobileNumber,
+          status: { $in: ['PENDING', 'ACCEPTED'] },
         },
+        options,
+      );
+    if (!context || !group || !invitation) return undefined;
+
+    const inviterMembership = await work.db
+      .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+      .findOne(
+        {
+          contextId: invitation.contextId,
+          participantId: invitation.inviterParticipantId,
+          status: 'ACTIVE',
+          role: { $in: ['OWNER', 'ADMIN'] },
+        },
+        options,
+      );
+    const now = new Date();
+    if (invitation.status === 'PENDING' && (invitation.expiresAt <= now || !inviterMembership)) {
+      const status = invitation.expiresAt <= now ? 'EXPIRED' : 'REVOKED';
+      await work.db.collection<InvitationDocument>(COLLECTIONS.invitations).updateOne(
+        { _id: invitation._id, status: 'PENDING' },
+        {
+          $set: {
+            status,
+            respondedAt: now,
+            updatedAt: now,
+            ...(status === 'REVOKED' ? { revokedAt: now } : {}),
+          },
+        },
+        options,
       );
       return undefined;
     }
 
-    const actorResult = await this.oracle.execute<RegisteredTargetRow>(
-      connection,
-      `SELECT U.USER_ID, P.PARTICIPANT_ID, P.DISPLAY_NAME, U.STATUS,
-              CASE WHEN U.MOBILE_VERIFIED_AT_UTC IS NULL THEN 'N' ELSE 'Y' END AS VERIFIED_FLAG,
-              AVATAR.MEDIA_ID AS AVATAR_MEDIA_ID
-         FROM SPLITO_USERS U
-         JOIN SPLITO_PARTICIPANTS P ON P.USER_ID = U.USER_ID AND P.KIND = 'USER'
-         LEFT JOIN SPLITO_MEDIA_OBJECTS AVATAR
-           ON AVATAR.OWNER_USER_ID = U.USER_ID
-          AND AVATAR.STORAGE_KEY = U.AVATAR_KEY
-          AND AVATAR.MEDIA_KIND = 'USER_AVATAR'
-          AND AVATAR.STATUS = 'ACTIVE'
-        WHERE U.USER_ID = :actorUserId
-          AND P.PARTICIPANT_ID = :actorParticipantId
-          AND U.MOBILE_E164 = :mobileNumber
-          AND U.MOBILE_VERIFIED_AT_UTC IS NOT NULL
-          AND U.STATUS = 'ACTIVE'
-        FOR UPDATE OF U.STATUS`,
+    const user = await work.db.collection<UserDocument>(COLLECTIONS.users).findOne(
       {
-        actorUserId: uuidToRaw(values.actorUserId),
-        actorParticipantId: uuidToRaw(values.actorParticipantId),
-        mobileNumber: values.mobileNumber,
+        _id: values.actorUserId,
+        mobileE164: values.mobileNumber,
+        mobileVerifiedAt: { $type: 'date' },
+        status: 'ACTIVE',
       },
+      options,
     );
-    const actorRow = actorResult.rows?.[0];
-    if (!actorRow) return undefined;
-    if (
-      invitation.STATUS === 'ACCEPTED' &&
-      !invitation.INVITEE_PARTICIPANT_ID?.equals(actorRow.PARTICIPANT_ID)
-    ) {
+    const participant = user
+      ? await work.db
+          .collection<ParticipantDocument>(COLLECTIONS.participants)
+          .findOne({ _id: values.actorParticipantId, userId: user._id, kind: 'USER' }, options)
+      : undefined;
+    if (!user || !participant) return undefined;
+    if (invitation.status === 'ACCEPTED' && invitation.inviteeParticipantId !== participant._id) {
       return undefined;
     }
-    const target = this.mapTarget(actorRow);
-
-    const activeResult = await this.oracle.execute<ActiveMemberRow>(
-      connection,
-      `SELECT MEMBER_ROLE, TO_CHAR(ALLOCATION_ORDER) AS ALLOCATION_ORDER
-         FROM SPLITO_CONTEXT_MEMBERS
-        WHERE CONTEXT_ID = :contextId
-          AND PARTICIPANT_ID = :participantId
-          AND STATUS = 'ACTIVE'
-        FOR UPDATE`,
+    const target = await this.targetFromDocuments(work, user, participant);
+    const members = work.db.collection<ContextMemberDocument>(COLLECTIONS.contextMembers);
+    let membership = await members.findOne(
       {
-        contextId: invitation.CONTEXT_ID,
-        participantId: actorRow.PARTICIPANT_ID,
+        contextId: invitation.contextId,
+        participantId: participant._id,
+        status: 'ACTIVE',
       },
+      options,
     );
-    let membership = activeResult.rows?.[0];
-    let membershipId: string | undefined;
-    if (invitation.STATUS === 'ACCEPTED') {
+    if (invitation.status === 'ACCEPTED') {
       if (!membership) return undefined;
-      return {
-        preview: this.mapPreview(invitation) as InvitationPreview,
-        member: this.memberResponse(target, membership.MEMBER_ROLE, membership.ALLOCATION_ORDER),
-      };
+      const replayPreview = await this.mapPreviewDocuments(work, invitation, group);
+      return replayPreview
+        ? {
+            preview: replayPreview,
+            member: this.memberResponse(target, membership.role, membership.allocationOrder),
+          }
+        : undefined;
     }
 
+    await this.bumpContextVersion(work, invitation.contextId);
+    let membershipId: string | undefined;
     if (!membership) {
-      const orderResult = await this.oracle.execute<{ NEXT_ORDER: string }>(
-        connection,
-        `SELECT TO_CHAR(NVL(MAX(ALLOCATION_ORDER), -1) + 1) AS NEXT_ORDER
-           FROM SPLITO_CONTEXT_MEMBERS
-          WHERE CONTEXT_ID = :contextId`,
-        { contextId: invitation.CONTEXT_ID },
-      );
-      const allocationOrder = orderResult.rows?.[0]?.NEXT_ORDER;
-      if (allocationOrder === undefined)
-        throw new Error('Oracle did not return a membership order');
+      const lastMember = await members
+        .find({ contextId: invitation.contextId }, options)
+        .sort({ allocationOrder: -1, _id: -1 })
+        .limit(1)
+        .next();
+      const allocationOrder = (lastMember?.allocationOrder ?? -1) + 1;
       membershipId = randomUUID();
-      await this.oracle.execute(
-        connection,
-        `INSERT INTO SPLITO_CONTEXT_MEMBERS (
-           MEMBERSHIP_ID, CONTEXT_ID, PARTICIPANT_ID, MEMBER_ROLE,
-           ALLOCATION_ORDER, ADDED_BY_PARTICIPANT_ID
-         ) VALUES (
-           :membershipId, :contextId, :participantId, 'MEMBER',
-           :allocationOrder, :inviterParticipantId
-         )`,
+      membership = {
+        _id: membershipId,
+        contextId: invitation.contextId,
+        participantId: participant._id,
+        role: 'MEMBER',
+        status: 'ACTIVE',
+        allocationOrder,
+        addedByParticipantId: invitation.inviterParticipantId,
+        joinedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await members.insertOne(membership, options);
+    }
+
+    const accepted = await work.db
+      .collection<InvitationDocument>(COLLECTIONS.invitations)
+      .updateOne(
+        { _id: invitation._id, status: 'PENDING' },
         {
-          membershipId: uuidToRaw(membershipId),
-          contextId: invitation.CONTEXT_ID,
-          participantId: actorRow.PARTICIPANT_ID,
-          allocationOrder,
-          inviterParticipantId: invitation.INVITER_PARTICIPANT_ID,
+          $set: {
+            status: 'ACCEPTED',
+            inviteeParticipantId: participant._id,
+            respondedAt: now,
+            updatedAt: now,
+          },
         },
+        options,
       );
-      membership = { MEMBER_ROLE: 'MEMBER', ALLOCATION_ORDER: allocationOrder };
-      await this.bumpContextVersion(connection, values.locator.contextId);
-    }
-
-    const accepted = await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_INVITATIONS
-          SET STATUS = 'ACCEPTED',
-              INVITEE_PARTICIPANT_ID = :participantId,
-              RESPONDED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE INVITATION_ID = :invitationId
-          AND STATUS = 'PENDING'`,
-      { participantId: actorRow.PARTICIPANT_ID, invitationId: invitation.INVITATION_ID },
-    );
-    if (accepted.rowsAffected !== 1) {
-      throw new Error('Invitation acceptance was not persisted');
-    }
-
-    await this.insertOutbox(connection, {
+    if (accepted.modifiedCount !== 1) throw new Error('Invitation acceptance was not persisted');
+    await this.insertOutbox(work, {
       eventType: 'group.invitation.accepted',
       aggregateType: 'INVITATION',
-      aggregateId: values.locator.invitationId,
+      aggregateId: invitation._id,
       payload: {
-        invitationId: values.locator.invitationId,
-        groupId: rawToUuid(invitation.GROUP_ID),
-        participantId: values.actorParticipantId,
+        invitationId: invitation._id,
+        groupId: group._id,
+        participantId: participant._id,
       },
     });
-    await this.insertAudit(connection, {
+    await this.insertAudit(work, {
       actorParticipantId: values.actorParticipantId,
       actorUserId: values.actorUserId,
       actionKey: 'group.invitation.accept',
       resourceType: 'INVITATION',
-      resourceId: values.locator.invitationId,
-      contextId: values.locator.contextId,
+      resourceId: invitation._id,
+      contextId: invitation.contextId,
       requestId: values.requestId,
       metadata: membershipId ? { membershipId } : { membershipAlreadyActive: true },
     });
-    return {
-      preview: this.mapPreview(invitation) as InvitationPreview,
-      member: this.memberResponse(target, membership.MEMBER_ROLE, membership.ALLOCATION_ORDER),
-    };
+    const acceptedPreview = await this.mapPreviewDocuments(work, invitation, group);
+    return acceptedPreview
+      ? {
+          preview: acceptedPreview,
+          member: this.memberResponse(target, membership.role, membership.allocationOrder),
+        }
+      : undefined;
   }
 
-  private mapTarget(row: RegisteredTargetRow): RegisteredTarget {
-    const participantId = rawToUuid(row.PARTICIPANT_ID);
+  private async previewForInvitation(
+    work: MongoUnitOfWork,
+    invitation: InvitationDocument,
+  ): Promise<InvitationPreview | undefined> {
+    const options = mongoOptions(work);
+    const context = await work.db
+      .collection<ContextDocument>(COLLECTIONS.contexts)
+      .findOne({ _id: invitation.contextId, status: 'ACTIVE' }, options);
+    const group = await work.db
+      .collection<GroupDocument>(COLLECTIONS.groups)
+      .findOne({ contextId: invitation.contextId }, options);
+    const inviterMembership = await work.db
+      .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+      .findOne(
+        {
+          contextId: invitation.contextId,
+          participantId: invitation.inviterParticipantId,
+          status: 'ACTIVE',
+          role: { $in: ['OWNER', 'ADMIN'] },
+        },
+        options,
+      );
+    if (!context || !group || !inviterMembership) return undefined;
+    return this.mapPreviewDocuments(work, invitation, group);
+  }
+
+  private async mapPreviewDocuments(
+    work: MongoUnitOfWork,
+    invitation: InvitationDocument,
+    group: GroupDocument,
+  ): Promise<InvitationPreview | undefined> {
+    const inviter = await work.db
+      .collection<ParticipantDocument>(COLLECTIONS.participants)
+      .findOne({ _id: invitation.inviterParticipantId }, mongoOptions(work));
+    return inviter
+      ? {
+          invitationId: invitation._id,
+          groupId: group._id,
+          groupName: group.name,
+          inviterDisplayName: inviter.displayName,
+          expiresAt: invitation.expiresAt.toISOString(),
+        }
+      : undefined;
+  }
+
+  private async targetFromDocuments(
+    work: MongoUnitOfWork,
+    user: UserDocument,
+    participant: ParticipantDocument,
+  ): Promise<RegisteredTarget> {
+    const avatar = user.avatarKey
+      ? await work.db.collection<MediaDocument>(COLLECTIONS.mediaObjects).findOne(
+          {
+            ownerUserId: user._id,
+            storageKey: user.avatarKey,
+            mediaKind: 'USER_AVATAR',
+            status: 'ACTIVE',
+          },
+          mongoOptions(work),
+        )
+      : undefined;
     return {
-      userId: rawToUuid(row.USER_ID),
-      participantId,
-      displayName: row.DISPLAY_NAME,
-      status: row.STATUS,
-      mobileVerified: row.VERIFIED_FLAG === 'Y',
-      ...(row.AVATAR_MEDIA_ID
-        ? { avatarUrl: participantAvatarUrl(participantId, rawToUuid(row.AVATAR_MEDIA_ID)) }
-        : {}),
+      userId: user._id,
+      participantId: participant._id,
+      displayName: participant.displayName,
+      status: user.status,
+      mobileVerified: Boolean(user.mobileVerifiedAt),
+      ...(user.mobileE164 ? { mobileNumber: user.mobileE164 } : {}),
+      ...(avatar ? { avatarUrl: participantAvatarUrl(participant._id, avatar._id) } : {}),
     };
   }
 
   private memberResponse(
     target: RegisteredTarget,
-    role: ActiveMemberRow['MEMBER_ROLE'],
-    allocationOrder: string,
+    role: MemberRole,
+    allocationOrder: number,
   ): GroupMember {
     return {
       id: target.participantId,
@@ -644,88 +652,85 @@ export class GroupInvitationsRepository {
       kind: 'USER',
       role: role === 'OWNER' ? 'owner' : role === 'ADMIN' ? 'administrator' : 'member',
       status: 'active',
-      allocationOrder: Number(allocationOrder),
+      allocationOrder,
     };
   }
 
-  private mapPreview(row: InvitationPreviewRow | undefined): InvitationPreview | undefined {
-    return row
-      ? {
-          invitationId: rawToUuid(row.INVITATION_ID),
-          groupId: rawToUuid(row.GROUP_ID),
-          groupName: row.GROUP_NAME,
-          inviterDisplayName: row.INVITER_DISPLAY_NAME,
-          expiresAt: row.EXPIRES_AT_TEXT,
-        }
-      : undefined;
-  }
-
   private async revokePendingInvitations(
-    connection: Connection,
+    work: MongoUnitOfWork,
     contextId: string,
     inviteeParticipantId: string,
   ): Promise<void> {
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_INVITATIONS
-          SET STATUS = 'REVOKED',
-              INVITEE_PARTICIPANT_ID = :participantId,
-              RESPONDED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-              REVOKED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE INVITATION_TYPE = 'GROUP'
-          AND CONTEXT_ID = :contextId
-          AND STATUS = 'PENDING'
-          AND INVITEE_MOBILE_E164 = (
-            SELECT U.MOBILE_E164
-              FROM SPLITO_PARTICIPANTS P
-              JOIN SPLITO_USERS U ON U.USER_ID = P.USER_ID
-             WHERE P.PARTICIPANT_ID = :participantId
-          )`,
+    const options = mongoOptions(work);
+    const participant = await work.db
+      .collection<ParticipantDocument>(COLLECTIONS.participants)
+      .findOne({ _id: inviteeParticipantId }, options);
+    const user = participant?.userId
+      ? await work.db
+          .collection<UserDocument>(COLLECTIONS.users)
+          .findOne({ _id: participant.userId }, options)
+      : undefined;
+    if (!user?.mobileE164) return;
+    const now = new Date();
+    await work.db.collection<InvitationDocument>(COLLECTIONS.invitations).updateMany(
       {
-        participantId: uuidToRaw(inviteeParticipantId),
-        contextId: uuidToRaw(contextId),
+        invitationType: 'GROUP',
+        contextId,
+        status: 'PENDING',
+        inviteeMobileE164: user.mobileE164,
       },
+      {
+        $set: {
+          status: 'REVOKED',
+          inviteeParticipantId,
+          respondedAt: now,
+          revokedAt: now,
+          updatedAt: now,
+        },
+      },
+      options,
     );
   }
 
-  private async bumpContextVersion(connection: Connection, contextId: string): Promise<void> {
-    const result = await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_CONTEXTS
-          SET VERSION_NO = VERSION_NO + 1,
-              UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE CONTEXT_ID = :contextId`,
-      { contextId: uuidToRaw(contextId) },
-    );
-    if (result.rowsAffected !== 1) throw new Error('Group context version was not updated');
+  private async bumpContextVersion(work: MongoUnitOfWork, contextId: string): Promise<void> {
+    const result = await work.db
+      .collection<ContextDocument>(COLLECTIONS.contexts)
+      .updateOne(
+        { _id: contextId, status: 'ACTIVE' },
+        { $inc: { mutationVersion: 1 }, $set: { updatedAt: new Date() } },
+        mongoOptions(work),
+      );
+    if (result.matchedCount !== 1) throw new Error('Group context version was not updated');
   }
 
-  private insertOutbox(
-    connection: Connection,
+  private async insertOutbox(
+    work: MongoUnitOfWork,
     values: {
       readonly eventType: string;
       readonly aggregateType: string;
       readonly aggregateId: string;
       readonly payload: unknown;
     },
-  ): Promise<unknown> {
-    return this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_OUTBOX (
-         OUTBOX_ID, EVENT_TYPE, AGGREGATE_TYPE, AGGREGATE_ID, PAYLOAD_JSON
-       ) VALUES (:outboxId, :eventType, :aggregateType, :aggregateId, :payload)`,
+  ): Promise<void> {
+    const now = new Date();
+    await work.db.collection<EventDocument>(COLLECTIONS.outbox).insertOne(
       {
-        outboxId: uuidToRaw(randomUUID()),
+        _id: randomUUID(),
         eventType: values.eventType,
         aggregateType: values.aggregateType,
-        aggregateId: uuidToRaw(values.aggregateId),
-        payload: JSON.stringify(values.payload),
+        aggregateId: values.aggregateId,
+        payload: values.payload,
+        status: 'PENDING',
+        availableAt: now,
+        attempts: 0,
+        createdAt: now,
       },
+      mongoOptions(work),
     );
   }
 
-  private insertAudit(
-    connection: Connection,
+  private async insertAudit(
+    work: MongoUnitOfWork,
     values: {
       readonly actorParticipantId: string;
       readonly actorUserId: string;
@@ -736,27 +741,21 @@ export class GroupInvitationsRepository {
       readonly requestId: string;
       readonly metadata: unknown;
     },
-  ): Promise<unknown> {
-    return this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_AUDIT_EVENTS (
-         AUDIT_EVENT_ID, ACTOR_PARTICIPANT_ID, ACTOR_USER_ID, ACTION_KEY,
-         RESOURCE_TYPE, RESOURCE_ID, CONTEXT_ID, REQUEST_ID, METADATA_JSON
-       ) VALUES (
-         :auditId, :actorParticipantId, :actorUserId, :actionKey,
-         :resourceType, :resourceId, :contextId, :requestId, :metadata
-       )`,
+  ): Promise<void> {
+    await work.db.collection<EventDocument>(COLLECTIONS.auditEvents).insertOne(
       {
-        auditId: uuidToRaw(randomUUID()),
-        actorParticipantId: uuidToRaw(values.actorParticipantId),
-        actorUserId: uuidToRaw(values.actorUserId),
+        _id: randomUUID(),
+        actorParticipantId: values.actorParticipantId,
+        actorUserId: values.actorUserId,
         actionKey: values.actionKey,
         resourceType: values.resourceType,
-        resourceId: uuidToRaw(values.resourceId),
-        contextId: uuidToRaw(values.contextId),
+        resourceId: values.resourceId,
+        contextId: values.contextId,
         requestId: values.requestId,
-        metadata: JSON.stringify(values.metadata),
+        metadata: values.metadata,
+        createdAt: new Date(),
       },
+      mongoOptions(work),
     );
   }
 }

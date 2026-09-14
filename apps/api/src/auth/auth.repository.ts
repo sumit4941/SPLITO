@@ -1,14 +1,118 @@
+import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
-import oracledb, { type Connection } from 'oracledb';
-import { OracleService } from '../database/oracle.service.js';
-import { rawToUuid, uuidToRaw } from '../database/uuid.js';
+import {
+  COLLECTIONS,
+  MongoService,
+  mongoOptions,
+  type MongoUnitOfWork,
+} from '../database/mongo.service.js';
 import { participantAvatarUrl } from '../media/media.types.js';
 import type { RegisterInput } from './auth.schemas.js';
 import type { AuthContext, AuthenticatedUser } from './auth.types.js';
 
+type AccountStatus = 'PENDING' | 'ACTIVE' | 'LOCKED' | 'DELETION_PENDING' | 'ANONYMIZED';
+const OTP_CHALLENGE_RETENTION_MILLISECONDS = 30 * 24 * 60 * 60 * 1_000;
+
+interface UserDocument {
+  _id: string;
+  emailNormalized?: string;
+  mobileE164?: string;
+  passwordHash?: string;
+  displayName: string;
+  localeCode: string;
+  timezoneName: string;
+  defaultCurrencyCode: string;
+  theme: 'LIGHT' | 'DARK' | 'SYSTEM';
+  reducedMotion: boolean;
+  status: AccountStatus;
+  authFence: number;
+  avatarKey?: string;
+  emailVerifiedAt?: Date;
+  mobileVerifiedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface ParticipantDocument {
+  _id: string;
+  userId?: string;
+  kind: 'USER' | 'GUEST';
+  displayName: string;
+  status: 'ACTIVE' | 'MERGED' | 'DELETED';
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface MediaDocument {
+  _id: string;
+  ownerUserId?: string;
+  storageKey: string;
+  mediaKind: 'USER_AVATAR' | 'GROUP_IMAGE';
+  status: 'ACTIVE' | 'SUPERSEDED' | 'DELETED';
+}
+
+interface AuthTokenDocument {
+  _id: string;
+  userId: string;
+  tokenType: 'EMAIL_VERIFY' | 'PASSWORD_RESET';
+  tokenHash: Buffer;
+  expiresAt: Date;
+  consumedAt?: Date;
+  createdAt: Date;
+}
+
+interface SessionDocument {
+  _id: string;
+  sessionId: string;
+  userId: string;
+  sessionTokenHash: Buffer;
+  csrfSecretHash: Buffer;
+  deviceName?: string;
+  userAgentSummary: string;
+  ipAddressHash: Buffer;
+  expiresAt: Date;
+  lastSeenAt: Date;
+  active: boolean;
+  revokedAt?: Date;
+  revokedReason?: 'SINGLE_ACTIVE_LOGIN' | 'USER_LOGOUT';
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface MobileOtpChallengeDocument {
+  _id: string;
+  challengeId: string;
+  mobileE164: string;
+  purpose: 'LOGIN';
+  otpHash: Buffer;
+  requestIpHash: Buffer;
+  status: 'PENDING' | 'VERIFIED' | 'EXPIRED' | 'LOCKED' | 'SUPERSEDED';
+  attemptCount: number;
+  maxAttempts: number;
+  expiresAt: Date;
+  purgeAt: Date;
+  lastAttemptAt?: Date;
+  consumedAt?: Date;
+  terminalAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface MobileOtpThrottleDocument {
+  _id: string;
+  scope: 'PHONE' | 'IP';
+  throttleKey: Buffer;
+  requestCount: number;
+  windowStartedAt: Date;
+  lastIssuedAt?: Date;
+  purgeAt: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export interface LoginRow {
-  USER_ID: Buffer;
-  PARTICIPANT_ID: Buffer;
+  USER_ID: string;
+  PARTICIPANT_ID: string;
   EMAIL_NORMALIZED: string | null;
   MOBILE_E164: string | null;
   PASSWORD_HASH: string | null;
@@ -18,19 +122,14 @@ export interface LoginRow {
   DEFAULT_CURRENCY_CODE: string;
   THEME: 'LIGHT' | 'DARK' | 'SYSTEM';
   REDUCED_MOTION_FLAG: 'Y' | 'N';
-  AVATAR_MEDIA_ID: Buffer | null;
-  STATUS: string;
+  AVATAR_MEDIA_ID: string | null;
+  STATUS: AccountStatus;
   VERSION_NO: string;
-}
-
-interface SessionRow extends Omit<LoginRow, 'PASSWORD_HASH' | 'STATUS'> {
-  SESSION_ID: Buffer;
-  CSRF_SECRET_HASH: Buffer;
 }
 
 export interface SessionValues {
   readonly sessionId: string;
-  readonly userId: Buffer;
+  readonly userId: string;
   readonly tokenHash: Buffer;
   readonly csrfHash: Buffer;
   readonly deviceName?: string;
@@ -40,17 +139,12 @@ export interface SessionValues {
 }
 
 export interface MobileOtpChallengeRow {
-  OTP_CHALLENGE_ID: Buffer;
+  OTP_CHALLENGE_ID: string;
   MOBILE_E164: string;
   OTP_HASH: Buffer;
-  STATUS: 'PENDING' | 'VERIFIED' | 'EXPIRED' | 'LOCKED' | 'SUPERSEDED';
+  STATUS: MobileOtpChallengeDocument['status'];
   ATTEMPT_COUNT: string;
   MAX_ATTEMPTS: string;
-  EXPIRED_FLAG: 'Y' | 'N';
-}
-
-interface PendingMobileOtpRow {
-  OTP_CHALLENGE_ID: Buffer;
   EXPIRED_FLAG: 'Y' | 'N';
 }
 
@@ -78,29 +172,23 @@ export type MobileOtpAuthenticationResult =
   | { readonly outcome: 'account_unavailable' }
   | { readonly outcome: 'invalid' };
 
-function oracleErrorNumber(error: unknown): number | undefined {
-  return typeof error === 'object' && error !== null && 'errorNum' in error
-    ? Number(error.errorNum)
-    : undefined;
-}
-
 export function rowToAuthenticatedUser(
   row: Omit<LoginRow, 'PASSWORD_HASH' | 'STATUS'>,
 ): AuthenticatedUser {
-  const participantId = rawToUuid(row.PARTICIPANT_ID);
+  const participantId = row.PARTICIPANT_ID;
   return {
     id: participantId,
-    userId: rawToUuid(row.USER_ID),
+    userId: row.USER_ID,
     participantId,
     ...(row.EMAIL_NORMALIZED ? { email: row.EMAIL_NORMALIZED } : {}),
     ...(row.MOBILE_E164 ? { mobileNumber: row.MOBILE_E164 } : {}),
     displayName: row.DISPLAY_NAME,
     ...(row.AVATAR_MEDIA_ID
-      ? { avatarUrl: participantAvatarUrl(participantId, rawToUuid(row.AVATAR_MEDIA_ID)) }
+      ? { avatarUrl: participantAvatarUrl(participantId, row.AVATAR_MEDIA_ID) }
       : {}),
     locale: row.LOCALE_CODE,
     timezone: row.TIMEZONE_NAME,
-    defaultCurrency: row.DEFAULT_CURRENCY_CODE.trim(),
+    defaultCurrency: row.DEFAULT_CURRENCY_CODE,
     theme: row.THEME.toLowerCase() as AuthenticatedUser['theme'],
     reducedMotion: row.REDUCED_MOTION_FLAG === 'Y',
     version: row.VERSION_NO,
@@ -109,10 +197,10 @@ export function rowToAuthenticatedUser(
 
 @Injectable()
 export class AuthRepository {
-  constructor(private readonly oracle: OracleService) {}
+  constructor(private readonly mongo: MongoService) {}
 
   async createPendingAccount(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: RegisterInput & {
       readonly userId: string;
       readonly participantId: string;
@@ -124,150 +212,132 @@ export class AuthRepository {
       readonly auditId: string;
     },
   ): Promise<void> {
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_USERS (
-         USER_ID, EMAIL_NORMALIZED, PASSWORD_HASH, DISPLAY_NAME, LOCALE_CODE,
-         TIMEZONE_NAME, DEFAULT_CURRENCY_CODE, STATUS
-       ) VALUES (
-         :userId, :email, :passwordHash, :displayName, :localeCode,
-         :timezoneName, :currencyCode, 'PENDING'
-       )`,
+    const now = new Date();
+    const options = mongoOptions(work);
+    const userId = values.userId.toLowerCase();
+    const participantId = values.participantId.toLowerCase();
+    await work.db.collection<UserDocument>(COLLECTIONS.users).insertOne(
       {
-        userId: uuidToRaw(values.userId),
-        email: values.email,
+        _id: userId,
+        emailNormalized: values.email,
         passwordHash: values.passwordHash,
         displayName: values.displayName,
         localeCode: values.locale,
         timezoneName: values.timezone,
-        currencyCode: values.defaultCurrency,
+        defaultCurrencyCode: values.defaultCurrency,
+        theme: 'SYSTEM',
+        reducedMotion: false,
+        status: 'PENDING',
+        authFence: 1,
+        createdAt: now,
+        updatedAt: now,
       },
+      options,
     );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_PARTICIPANTS (
-         PARTICIPANT_ID, USER_ID, KIND, DISPLAY_NAME
-       ) VALUES (:participantId, :userId, 'USER', :displayName)`,
+    await work.db.collection<ParticipantDocument>(COLLECTIONS.participants).insertOne(
       {
-        participantId: uuidToRaw(values.participantId),
-        userId: uuidToRaw(values.userId),
+        _id: participantId,
+        userId,
+        kind: 'USER',
         displayName: values.displayName,
+        status: 'ACTIVE',
+        createdAt: now,
+        updatedAt: now,
       },
+      options,
     );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_USER_PREFERENCES (USER_ID) VALUES (:userId)`,
-      { userId: uuidToRaw(values.userId) },
-    );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_AUTH_TOKENS (
-         TOKEN_ID, USER_ID, TOKEN_TYPE, TOKEN_HASH, EXPIRES_AT_UTC
-       ) VALUES (
-         :tokenId, :userId, 'EMAIL_VERIFY', :tokenHash,
-         SYS_EXTRACT_UTC(SYSTIMESTAMP) + NUMTODSINTERVAL(24, 'HOUR')
-       )`,
+    await work.db
+      .collection<{ _id: string; userId: string; createdAt: Date; updatedAt: Date }>(
+        COLLECTIONS.userPreferences,
+      )
+      .insertOne({ _id: userId, userId, createdAt: now, updatedAt: now }, options);
+    await work.db.collection<AuthTokenDocument>(COLLECTIONS.authTokens).insertOne(
       {
-        tokenId: uuidToRaw(values.verificationTokenId),
-        userId: uuidToRaw(values.userId),
-        tokenHash: values.verificationTokenHash,
+        _id: values.verificationTokenId.toLowerCase(),
+        userId,
+        tokenType: 'EMAIL_VERIFY',
+        tokenHash: Buffer.from(values.verificationTokenHash),
+        expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1_000),
+        createdAt: now,
       },
+      options,
     );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_OUTBOX (
-         OUTBOX_ID, EVENT_TYPE, AGGREGATE_TYPE, AGGREGATE_ID, PAYLOAD_JSON
-       ) VALUES (
-         :outboxId, 'identity.email_verification_requested', 'USER', :userId, :payload
-       )`,
-      {
-        outboxId: uuidToRaw(values.outboxId),
-        userId: uuidToRaw(values.userId),
-        payload: {
-          val: JSON.stringify({ userId: values.userId, email: values.email }),
-          type: oracledb.CLOB,
+    await work.db
+      .collection<{ _id: string } & Record<string, unknown>>(COLLECTIONS.outbox)
+      .insertOne(
+        {
+          _id: values.outboxId.toLowerCase(),
+          eventType: 'identity.email_verification_requested',
+          aggregateType: 'USER',
+          aggregateId: userId,
+          payload: { userId, email: values.email },
+          status: 'PENDING',
+          availableAt: now,
+          attempts: 0,
+          createdAt: now,
         },
-      },
-    );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_AUDIT_EVENTS (
-         AUDIT_EVENT_ID, ACTOR_PARTICIPANT_ID, ACTOR_USER_ID, ACTION_KEY,
-         RESOURCE_TYPE, RESOURCE_ID, REQUEST_ID, METADATA_JSON
-       ) VALUES (
-         :auditId, :participantId, :userId, 'account.register',
-         'USER', :userId, :requestId, '{}'
-       )`,
-      {
-        auditId: uuidToRaw(values.auditId),
-        participantId: uuidToRaw(values.participantId),
-        userId: uuidToRaw(values.userId),
-        requestId: values.requestId,
-      },
-    );
+        options,
+      );
+    await work.db
+      .collection<{ _id: string } & Record<string, unknown>>(COLLECTIONS.auditEvents)
+      .insertOne(
+        {
+          _id: values.auditId.toLowerCase(),
+          actorParticipantId: participantId,
+          actorUserId: userId,
+          actionKey: 'account.register',
+          resourceType: 'USER',
+          resourceId: userId,
+          requestId: values.requestId,
+          metadata: {},
+          createdAt: now,
+        },
+        options,
+      );
   }
 
-  async consumeVerificationToken(connection: Connection, tokenHash: Buffer): Promise<boolean> {
-    const result = await this.oracle.execute<{ TOKEN_ID: Buffer; USER_ID: Buffer }>(
-      connection,
-      `SELECT TOKEN_ID, USER_ID
-         FROM SPLITO_AUTH_TOKENS
-        WHERE TOKEN_TYPE = 'EMAIL_VERIFY'
-          AND TOKEN_HASH = :tokenHash
-          AND CONSUMED_AT_UTC IS NULL
-          AND EXPIRES_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        FOR UPDATE`,
-      { tokenHash },
-    );
-    const row = result.rows?.[0];
-    if (!row) return false;
-
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_AUTH_TOKENS
-          SET CONSUMED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE TOKEN_ID = :tokenId`,
-      { tokenId: row.TOKEN_ID },
-    );
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_USERS
-          SET STATUS = 'ACTIVE',
-              EMAIL_VERIFIED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-              UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-              SECURITY_VERSION = SECURITY_VERSION + 1
-        WHERE USER_ID = :userId
-          AND STATUS = 'PENDING'`,
-      { userId: row.USER_ID },
+  async consumeVerificationToken(work: MongoUnitOfWork, tokenHash: Buffer): Promise<boolean> {
+    const now = new Date();
+    const options = mongoOptions(work);
+    const token = await work.db
+      .collection<AuthTokenDocument>(COLLECTIONS.authTokens)
+      .findOneAndUpdate(
+        {
+          tokenType: 'EMAIL_VERIFY',
+          tokenHash,
+          consumedAt: { $exists: false },
+          expiresAt: { $gt: now },
+        },
+        { $set: { consumedAt: now } },
+        { ...options, returnDocument: 'before' },
+      );
+    if (!token) return false;
+    await work.db.collection<UserDocument>(COLLECTIONS.users).updateOne(
+      { _id: token.userId, status: 'PENDING' },
+      {
+        $set: {
+          status: 'ACTIVE',
+          emailVerifiedAt: now,
+          updatedAt: now,
+        },
+        $inc: { authFence: 1 },
+      },
+      options,
     );
     return true;
   }
 
   async findLoginByEmail(email: string): Promise<LoginRow | undefined> {
-    return this.oracle.withConnection(async (connection) => {
-      const result = await this.oracle.execute<LoginRow>(
-        connection,
-        `SELECT U.USER_ID, P.PARTICIPANT_ID, U.EMAIL_NORMALIZED, U.MOBILE_E164, U.PASSWORD_HASH,
-                U.DISPLAY_NAME, U.LOCALE_CODE, U.TIMEZONE_NAME, U.DEFAULT_CURRENCY_CODE,
-                U.THEME, U.REDUCED_MOTION_FLAG, U.STATUS,
-                AVATAR.MEDIA_ID AS AVATAR_MEDIA_ID,
-                TO_CHAR(U.SECURITY_VERSION) AS VERSION_NO
-           FROM SPLITO_USERS U
-           JOIN SPLITO_PARTICIPANTS P ON P.USER_ID = U.USER_ID AND P.KIND = 'USER'
-           LEFT JOIN SPLITO_MEDIA_OBJECTS AVATAR
-             ON AVATAR.OWNER_USER_ID = U.USER_ID
-            AND AVATAR.STORAGE_KEY = U.AVATAR_KEY
-            AND AVATAR.MEDIA_KIND = 'USER_AVATAR'
-            AND AVATAR.STATUS = 'ACTIVE'
-          WHERE U.EMAIL_NORMALIZED = :email`,
-        { email },
-      );
-      return result.rows?.[0];
+    return this.mongo.withConnection(async (work) => {
+      const user = await work.db
+        .collection<UserDocument>(COLLECTIONS.users)
+        .findOne({ emailNormalized: email }, mongoOptions(work));
+      return user ? this.loginRow(work, user) : undefined;
     });
   }
 
   async issueMobileOtp(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly challengeId: string;
       readonly mobileNumber: string;
@@ -286,13 +356,13 @@ export class AuthRepository {
       readonly maxAttempts: number;
     },
   ): Promise<MobileOtpIssueResult> {
-    const phoneThrottle = await this.lockMobileOtpThrottle(connection, {
+    const phoneThrottle = await this.lockMobileOtpThrottle(work, {
       scope: 'PHONE',
       key: values.phoneHash,
       windowMinutes: values.windowMinutes,
       cooldownSeconds: values.cooldownSeconds,
     });
-    const ipThrottle = await this.lockMobileOtpThrottle(connection, {
+    const ipThrottle = await this.lockMobileOtpThrottle(work, {
       scope: 'IP',
       key: values.ipHash,
       windowMinutes: values.windowMinutes,
@@ -309,106 +379,85 @@ export class AuthRepository {
       Number(phoneThrottle.REQUEST_COUNT) >= values.phoneLimit ||
       Number(ipThrottle.REQUEST_COUNT) >= values.ipLimit
     ) {
-      const retrySeconds = Math.max(
-        Number(phoneThrottle.REQUEST_COUNT) >= values.phoneLimit
-          ? Number(phoneThrottle.WINDOW_RETRY_SECONDS)
-          : 1,
-        Number(ipThrottle.REQUEST_COUNT) >= values.ipLimit
-          ? Number(ipThrottle.WINDOW_RETRY_SECONDS)
-          : 1,
-      );
       return {
         outcome: 'rate_limited',
         reason: 'quota',
-        retryAfterSeconds: retrySeconds,
+        retryAfterSeconds: Math.max(
+          Number(phoneThrottle.REQUEST_COUNT) >= values.phoneLimit
+            ? Number(phoneThrottle.WINDOW_RETRY_SECONDS)
+            : 1,
+          Number(ipThrottle.REQUEST_COUNT) >= values.ipLimit
+            ? Number(ipThrottle.WINDOW_RETRY_SECONDS)
+            : 1,
+        ),
       };
     }
 
-    const pendingResult = await this.oracle.execute<PendingMobileOtpRow>(
-      connection,
-      `SELECT OTP_CHALLENGE_ID,
-              CASE WHEN EXPIRES_AT_UTC <= SYS_EXTRACT_UTC(SYSTIMESTAMP) THEN 'Y' ELSE 'N' END
-                AS EXPIRED_FLAG
-         FROM SPLITO_MOBILE_OTP_CHALLENGES
-        WHERE MOBILE_E164 = :mobileNumber
-          AND PURPOSE = 'LOGIN'
-          AND STATUS = 'PENDING'
-        FOR UPDATE`,
-      { mobileNumber: values.mobileNumber },
+    const now = new Date();
+    const options = mongoOptions(work);
+    const challenges = work.db.collection<MobileOtpChallengeDocument>(
+      COLLECTIONS.mobileOtpChallenges,
     );
-    const pending = pendingResult.rows?.[0];
-    if (pending) {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_MOBILE_OTP_CHALLENGES
-            SET STATUS = :status,
-                TERMINAL_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-          WHERE OTP_CHALLENGE_ID = :challengeId
-            AND STATUS = 'PENDING'`,
-        {
-          status: pending.EXPIRED_FLAG === 'Y' ? 'EXPIRED' : 'SUPERSEDED',
-          challengeId: pending.OTP_CHALLENGE_ID,
-        },
-      );
+    const slot = await challenges.findOne(
+      { mobileE164: values.mobileNumber, purpose: 'LOGIN' },
+      options,
+    );
+    const challenge: MobileOtpChallengeDocument = {
+      _id: slot?._id ?? values.challengeId.toLowerCase(),
+      challengeId: values.challengeId.toLowerCase(),
+      mobileE164: values.mobileNumber,
+      purpose: 'LOGIN',
+      otpHash: Buffer.from(values.otpHash),
+      requestIpHash: Buffer.from(values.ipHash),
+      status: 'PENDING',
+      attemptCount: 0,
+      maxAttempts: values.maxAttempts,
+      expiresAt: new Date(now.getTime() + values.ttlSeconds * 1_000),
+      purgeAt: new Date(now.getTime() + OTP_CHALLENGE_RETENTION_MILLISECONDS),
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (slot) {
+      const replaced = await challenges.replaceOne({ _id: slot._id }, challenge, options);
+      if (replaced.modifiedCount !== 1) throw new Error('OTP challenge slot was not replaced');
+    } else {
+      await challenges.insertOne(challenge, options);
     }
-
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_MOBILE_OTP_CHALLENGES (
-         OTP_CHALLENGE_ID, MOBILE_E164, OTP_HASH, REQUEST_IP_HASH,
-         MAX_ATTEMPTS, EXPIRES_AT_UTC
-       ) VALUES (
-         :challengeId, :mobileNumber, :otpHash, :ipHash,
-         :maxAttempts, SYS_EXTRACT_UTC(SYSTIMESTAMP)
-           + NUMTODSINTERVAL(:ttlSeconds, 'SECOND')
-       )`,
-      {
-        challengeId: uuidToRaw(values.challengeId),
-        mobileNumber: values.mobileNumber,
-        otpHash: values.otpHash,
-        ipHash: values.ipHash,
-        maxAttempts: values.maxAttempts,
-        ttlSeconds: values.ttlSeconds,
-      },
-    );
+    const throttles = work.db.collection<MobileOtpThrottleDocument>(COLLECTIONS.mobileOtpThrottles);
     for (const throttle of [
-      { scope: 'PHONE', key: values.phoneHash },
-      { scope: 'IP', key: values.ipHash },
-    ] as const) {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_MOBILE_OTP_THROTTLES
-            SET REQUEST_COUNT = REQUEST_COUNT + 1,
-                LAST_ISSUED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-                UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-          WHERE THROTTLE_SCOPE = :scope
-            AND THROTTLE_KEY = :throttleKey`,
+      { scope: 'PHONE' as const, key: values.phoneHash },
+      { scope: 'IP' as const, key: values.ipHash },
+    ]) {
+      await throttles.updateOne(
         { scope: throttle.scope, throttleKey: throttle.key },
+        {
+          $inc: { requestCount: 1 },
+          $set: { lastIssuedAt: now, updatedAt: now },
+        },
+        options,
       );
     }
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_AUDIT_EVENTS (
-         AUDIT_EVENT_ID, ACTION_KEY, RESOURCE_TYPE, RESOURCE_ID, REQUEST_ID,
-         IP_ADDRESS_HASH, USER_AGENT_SUMMARY, METADATA_JSON
-       ) VALUES (
-         :auditId, 'auth.mobile_otp.request', 'MOBILE_OTP', :challengeId, :requestId,
-         :ipHash, :userAgent, :metadata
-       )`,
-      {
-        auditId: uuidToRaw(values.auditId),
-        challengeId: uuidToRaw(values.challengeId),
-        requestId: values.requestId,
-        ipHash: values.ipHash,
-        userAgent: values.userAgent.slice(0, 500),
-        metadata: JSON.stringify({ deliveryMode: values.deliveryMode }),
-      },
-    );
+    await work.db
+      .collection<{ _id: string } & Record<string, unknown>>(COLLECTIONS.auditEvents)
+      .insertOne(
+        {
+          _id: values.auditId.toLowerCase(),
+          actionKey: 'auth.mobile_otp.request',
+          resourceType: 'MOBILE_OTP',
+          resourceId: values.challengeId.toLowerCase(),
+          requestId: values.requestId,
+          ipAddressHash: Buffer.from(values.ipHash),
+          userAgentSummary: values.userAgent.slice(0, 500),
+          metadata: { deliveryMode: values.deliveryMode },
+          createdAt: now,
+        },
+        options,
+      );
     return { outcome: 'created' };
   }
 
   async lockMobileOtpThrottle(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly scope: 'PHONE' | 'IP';
       readonly key: Buffer;
@@ -416,127 +465,142 @@ export class AuthRepository {
       readonly cooldownSeconds: number;
     },
   ): Promise<MobileOtpThrottleRow> {
-    try {
-      await this.oracle.execute(
-        connection,
-        `INSERT INTO SPLITO_MOBILE_OTP_THROTTLES (
-           THROTTLE_SCOPE, THROTTLE_KEY
-         ) VALUES (
-           :scope, :throttleKey
-         )`,
-        { scope: values.scope, throttleKey: values.key },
-      );
-    } catch (error) {
-      if (oracleErrorNumber(error) !== 1) throw error;
-    }
-
-    const result = await this.oracle.execute<MobileOtpThrottleRow>(
-      connection,
-      `SELECT TO_CHAR(REQUEST_COUNT) AS REQUEST_COUNT,
-              CASE WHEN WINDOW_STARTED_AT_UTC <= SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                   - NUMTODSINTERVAL(:windowMinutes, 'MINUTE') THEN 'Y' ELSE 'N' END
-                AS WINDOW_EXPIRED_FLAG,
-              CASE WHEN LAST_ISSUED_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                   - NUMTODSINTERVAL(:cooldownSeconds, 'SECOND') THEN 'Y' ELSE 'N' END
-                AS COOLDOWN_FLAG,
-              TO_CHAR(GREATEST(
-                1,
-                CEIL((
-                  CAST(WINDOW_STARTED_AT_UTC AS DATE) + (:windowMinutes / 1440)
-                  - CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS DATE)
-                ) * 86400)
-              )) AS WINDOW_RETRY_SECONDS
-         FROM SPLITO_MOBILE_OTP_THROTTLES
-        WHERE THROTTLE_SCOPE = :scope
-          AND THROTTLE_KEY = :throttleKey
-        FOR UPDATE`,
-      {
-        scope: values.scope,
-        throttleKey: values.key,
-        windowMinutes: values.windowMinutes,
-        cooldownSeconds: values.cooldownSeconds,
-      },
+    const now = new Date();
+    const options = mongoOptions(work);
+    const collection = work.db.collection<MobileOtpThrottleDocument>(
+      COLLECTIONS.mobileOtpThrottles,
     );
-    const row = result.rows?.[0];
-    if (!row) throw new Error('OTP throttle row could not be locked');
-    if (row.WINDOW_EXPIRED_FLAG === 'N') return row;
-
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_MOBILE_OTP_THROTTLES
-          SET WINDOW_STARTED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-              REQUEST_COUNT = 0,
-              UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE THROTTLE_SCOPE = :scope
-          AND THROTTLE_KEY = :throttleKey`,
+    await collection.updateOne(
       { scope: values.scope, throttleKey: values.key },
+      {
+        $setOnInsert: {
+          _id: randomUUID(),
+          scope: values.scope,
+          throttleKey: Buffer.from(values.key),
+          requestCount: 0,
+          windowStartedAt: now,
+          purgeAt: new Date(now.getTime() + values.windowMinutes * 60 * 1_000),
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+      { ...options, upsert: true },
+    );
+    let throttle = await collection.findOne(
+      { scope: values.scope, throttleKey: values.key },
+      options,
+    );
+    if (!throttle) throw new Error('OTP throttle could not be loaded');
+    const windowMilliseconds = values.windowMinutes * 60 * 1_000;
+    const windowExpired = throttle.windowStartedAt.getTime() <= now.getTime() - windowMilliseconds;
+    const cooldown = Boolean(
+      throttle.lastIssuedAt &&
+      throttle.lastIssuedAt.getTime() > now.getTime() - values.cooldownSeconds * 1_000,
+    );
+    if (windowExpired) {
+      await collection.updateOne(
+        { _id: throttle._id },
+        {
+          $set: {
+            windowStartedAt: now,
+            requestCount: 0,
+            purgeAt: new Date(now.getTime() + windowMilliseconds),
+            updatedAt: now,
+          },
+        },
+        options,
+      );
+      throttle = {
+        ...throttle,
+        windowStartedAt: now,
+        requestCount: 0,
+        purgeAt: new Date(now.getTime() + windowMilliseconds),
+        updatedAt: now,
+      };
+    }
+    const retrySeconds = Math.max(
+      1,
+      Math.ceil((throttle.windowStartedAt.getTime() + windowMilliseconds - now.getTime()) / 1_000),
     );
     return {
-      REQUEST_COUNT: '0',
+      REQUEST_COUNT: String(throttle.requestCount),
       WINDOW_EXPIRED_FLAG: 'N',
-      COOLDOWN_FLAG: row.COOLDOWN_FLAG,
-      WINDOW_RETRY_SECONDS: String(values.windowMinutes * 60),
+      COOLDOWN_FLAG: cooldown ? 'Y' : 'N',
+      WINDOW_RETRY_SECONDS: String(retrySeconds),
     };
   }
 
   async lockMobileOtpChallenge(
-    connection: Connection,
+    work: MongoUnitOfWork,
     challengeId: string,
     mobileNumber: string,
   ): Promise<MobileOtpChallengeRow | undefined> {
-    const result = await this.oracle.execute<MobileOtpChallengeRow>(
-      connection,
-      `SELECT OTP_CHALLENGE_ID, MOBILE_E164, OTP_HASH, STATUS,
-              TO_CHAR(ATTEMPT_COUNT) AS ATTEMPT_COUNT,
-              TO_CHAR(MAX_ATTEMPTS) AS MAX_ATTEMPTS,
-              CASE WHEN EXPIRES_AT_UTC <= SYS_EXTRACT_UTC(SYSTIMESTAMP) THEN 'Y' ELSE 'N' END
-                AS EXPIRED_FLAG
-         FROM SPLITO_MOBILE_OTP_CHALLENGES
-        WHERE OTP_CHALLENGE_ID = :challengeId
-          AND MOBILE_E164 = :mobileNumber
-        FOR UPDATE`,
-      { challengeId: uuidToRaw(challengeId), mobileNumber },
-    );
-    return result.rows?.[0];
+    const challenge = await work.db
+      .collection<MobileOtpChallengeDocument>(COLLECTIONS.mobileOtpChallenges)
+      .findOne(
+        { challengeId: challengeId.toLowerCase(), mobileE164: mobileNumber },
+        mongoOptions(work),
+      );
+    return challenge
+      ? {
+          OTP_CHALLENGE_ID: challenge.challengeId,
+          MOBILE_E164: challenge.mobileE164,
+          OTP_HASH: challenge.otpHash,
+          STATUS: challenge.status,
+          ATTEMPT_COUNT: String(challenge.attemptCount),
+          MAX_ATTEMPTS: String(challenge.maxAttempts),
+          EXPIRED_FLAG: challenge.expiresAt <= new Date() ? 'Y' : 'N',
+        }
+      : undefined;
   }
 
-  async expireMobileOtp(connection: Connection, challengeId: Buffer): Promise<void> {
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_MOBILE_OTP_CHALLENGES
-          SET STATUS = 'EXPIRED',
-              TERMINAL_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE OTP_CHALLENGE_ID = :challengeId
-          AND STATUS = 'PENDING'`,
-      { challengeId },
-    );
+  async expireMobileOtp(work: MongoUnitOfWork, challengeId: string): Promise<void> {
+    const now = new Date();
+    await work.db
+      .collection<MobileOtpChallengeDocument>(COLLECTIONS.mobileOtpChallenges)
+      .updateOne(
+        { challengeId: challengeId.toLowerCase(), status: 'PENDING' },
+        { $set: { status: 'EXPIRED', terminalAt: now, updatedAt: now } },
+        mongoOptions(work),
+      );
   }
 
-  async recordFailedMobileOtpAttempt(connection: Connection, challengeId: Buffer): Promise<void> {
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_MOBILE_OTP_CHALLENGES
-          SET ATTEMPT_COUNT = ATTEMPT_COUNT + 1,
-              LAST_ATTEMPT_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-              STATUS = CASE
-                WHEN ATTEMPT_COUNT + 1 >= MAX_ATTEMPTS THEN 'LOCKED'
-                ELSE 'PENDING'
-              END,
-              TERMINAL_AT_UTC = CASE
-                WHEN ATTEMPT_COUNT + 1 >= MAX_ATTEMPTS
-                  THEN SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                ELSE NULL
-              END
-        WHERE OTP_CHALLENGE_ID = :challengeId
-          AND STATUS = 'PENDING'`,
-      { challengeId },
+  async recordFailedMobileOtpAttempt(work: MongoUnitOfWork, challengeId: string): Promise<void> {
+    const options = mongoOptions(work);
+    const challenges = work.db.collection<MobileOtpChallengeDocument>(
+      COLLECTIONS.mobileOtpChallenges,
+    );
+    const challenge = await challenges.findOne(
+      { challengeId: challengeId.toLowerCase(), status: 'PENDING' },
+      options,
+    );
+    if (!challenge) return;
+    const attemptCount = challenge.attemptCount + 1;
+    const locked = attemptCount >= challenge.maxAttempts;
+    const now = new Date();
+    await challenges.updateOne(
+      {
+        challengeId: challengeId.toLowerCase(),
+        status: 'PENDING',
+        attemptCount: challenge.attemptCount,
+      },
+      {
+        $set: {
+          attemptCount,
+          lastAttemptAt: now,
+          status: locked ? 'LOCKED' : 'PENDING',
+          updatedAt: now,
+          ...(locked ? { terminalAt: now } : {}),
+        },
+      },
+      options,
     );
   }
 
   async authenticateMobileOtp(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
-      readonly challengeId: Buffer;
+      readonly challengeId: string;
       readonly mobileNumber: string;
       readonly newUserId: string;
       readonly newParticipantId: string;
@@ -548,279 +612,268 @@ export class AuthRepository {
       readonly auditId: string;
     },
   ): Promise<MobileOtpAuthenticationResult> {
-    const existingResult = await this.oracle.execute<LoginRow>(
-      connection,
-      `SELECT U.USER_ID, P.PARTICIPANT_ID, U.EMAIL_NORMALIZED, U.MOBILE_E164, U.PASSWORD_HASH,
-              U.DISPLAY_NAME, U.LOCALE_CODE, U.TIMEZONE_NAME, U.DEFAULT_CURRENCY_CODE,
-              U.THEME, U.REDUCED_MOTION_FLAG, U.STATUS,
-              AVATAR.MEDIA_ID AS AVATAR_MEDIA_ID,
-              TO_CHAR(U.SECURITY_VERSION) AS VERSION_NO
-         FROM SPLITO_USERS U
-         JOIN SPLITO_PARTICIPANTS P ON P.USER_ID = U.USER_ID AND P.KIND = 'USER'
-         LEFT JOIN SPLITO_MEDIA_OBJECTS AVATAR
-           ON AVATAR.OWNER_USER_ID = U.USER_ID
-          AND AVATAR.STORAGE_KEY = U.AVATAR_KEY
-          AND AVATAR.MEDIA_KIND = 'USER_AVATAR'
-          AND AVATAR.STATUS = 'ACTIVE'
-        WHERE U.MOBILE_E164 = :mobileNumber
-        FOR UPDATE OF U.STATUS`,
-      { mobileNumber: values.mobileNumber },
-    );
-    let account = existingResult.rows?.[0];
-    const isNewAccount = !account;
-
-    if (account && account.STATUS !== 'ACTIVE' && account.STATUS !== 'PENDING') {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_MOBILE_OTP_CHALLENGES
-            SET STATUS = 'SUPERSEDED',
-                TERMINAL_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-          WHERE OTP_CHALLENGE_ID = :challengeId
-            AND STATUS = 'PENDING'`,
-        { challengeId: values.challengeId },
-      );
+    const options = mongoOptions(work);
+    const users = work.db.collection<UserDocument>(COLLECTIONS.users);
+    let user = await users.findOne({ mobileE164: values.mobileNumber }, options);
+    const isNewAccount = !user;
+    if (user && user.status !== 'ACTIVE' && user.status !== 'PENDING') {
+      const now = new Date();
+      await work.db
+        .collection<MobileOtpChallengeDocument>(COLLECTIONS.mobileOtpChallenges)
+        .updateOne(
+          { challengeId: values.challengeId.toLowerCase(), status: 'PENDING' },
+          { $set: { status: 'SUPERSEDED', terminalAt: now, updatedAt: now } },
+          options,
+        );
       return { outcome: 'account_unavailable' };
     }
 
-    const consumeResult = await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_MOBILE_OTP_CHALLENGES
-          SET STATUS = 'VERIFIED',
-              CONSUMED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-              LAST_ATTEMPT_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-              TERMINAL_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE OTP_CHALLENGE_ID = :challengeId
-          AND STATUS = 'PENDING'
-          AND EXPIRES_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)`,
-      { challengeId: values.challengeId },
-    );
-    if (consumeResult.rowsAffected !== 1) {
-      await this.expireMobileOtp(connection, values.challengeId);
+    const now = new Date();
+    const consumed = await work.db
+      .collection<MobileOtpChallengeDocument>(COLLECTIONS.mobileOtpChallenges)
+      .updateOne(
+        {
+          challengeId: values.challengeId.toLowerCase(),
+          status: 'PENDING',
+          expiresAt: { $gt: now },
+        },
+        {
+          $set: {
+            status: 'VERIFIED',
+            consumedAt: now,
+            lastAttemptAt: now,
+            terminalAt: now,
+            updatedAt: now,
+          },
+        },
+        options,
+      );
+    if (consumed.modifiedCount !== 1) {
+      await this.expireMobileOtp(work, values.challengeId);
       return { outcome: 'invalid' };
     }
 
-    if (!account) {
-      const userId = uuidToRaw(values.newUserId);
-      const participantId = uuidToRaw(values.newParticipantId);
-      await this.oracle.execute(
-        connection,
-        `INSERT INTO SPLITO_USERS (
-           USER_ID, MOBILE_E164, MOBILE_VERIFIED_AT_UTC, DISPLAY_NAME,
-           LOCALE_CODE, TIMEZONE_NAME, STATUS
-         ) VALUES (
-           :userId, :mobileNumber, SYS_EXTRACT_UTC(SYSTIMESTAMP), :displayName,
-           :localeCode, :timezoneName, 'ACTIVE'
-         )`,
-        {
-          userId,
-          mobileNumber: values.mobileNumber,
-          displayName: values.displayName,
-          localeCode: values.locale,
-          timezoneName: values.timezone,
-        },
-      );
-      await this.oracle.execute(
-        connection,
-        `INSERT INTO SPLITO_PARTICIPANTS (
-           PARTICIPANT_ID, USER_ID, KIND, DISPLAY_NAME
-         ) VALUES (
-           :participantId, :userId, 'USER', :displayName
-         )`,
-        { participantId, userId, displayName: values.displayName },
-      );
-      await this.oracle.execute(
-        connection,
-        `INSERT INTO SPLITO_USER_PREFERENCES (USER_ID) VALUES (:userId)`,
-        { userId },
-      );
-      account = {
-        USER_ID: userId,
-        PARTICIPANT_ID: participantId,
-        EMAIL_NORMALIZED: null,
-        MOBILE_E164: values.mobileNumber,
-        PASSWORD_HASH: null,
-        DISPLAY_NAME: values.displayName,
-        LOCALE_CODE: values.locale,
-        TIMEZONE_NAME: values.timezone,
-        DEFAULT_CURRENCY_CODE: 'INR',
-        THEME: 'SYSTEM',
-        REDUCED_MOTION_FLAG: 'N',
-        AVATAR_MEDIA_ID: null,
-        STATUS: 'ACTIVE',
-        VERSION_NO: '1',
+    let participant: ParticipantDocument | null;
+    if (!user) {
+      const userId = values.newUserId.toLowerCase();
+      const participantId = values.newParticipantId.toLowerCase();
+      user = {
+        _id: userId,
+        mobileE164: values.mobileNumber,
+        mobileVerifiedAt: now,
+        displayName: values.displayName,
+        localeCode: values.locale,
+        timezoneName: values.timezone,
+        defaultCurrencyCode: 'INR',
+        theme: 'SYSTEM',
+        reducedMotion: false,
+        status: 'ACTIVE',
+        authFence: 1,
+        createdAt: now,
+        updatedAt: now,
       };
-    } else if (account.STATUS === 'PENDING') {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_USERS
-            SET STATUS = 'ACTIVE',
-                MOBILE_VERIFIED_AT_UTC = COALESCE(
-                  MOBILE_VERIFIED_AT_UTC, SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                ),
-                UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-                SECURITY_VERSION = SECURITY_VERSION + 1
-          WHERE USER_ID = :userId`,
-        { userId: account.USER_ID },
-      );
-      account = {
-        ...account,
-        STATUS: 'ACTIVE',
-        VERSION_NO: String(Number(account.VERSION_NO) + 1),
+      participant = {
+        _id: participantId,
+        userId,
+        kind: 'USER',
+        displayName: values.displayName,
+        status: 'ACTIVE',
+        createdAt: now,
+        updatedAt: now,
       };
+      await users.insertOne(user, options);
+      await work.db
+        .collection<ParticipantDocument>(COLLECTIONS.participants)
+        .insertOne(participant, options);
+      await work.db
+        .collection<{ _id: string; userId: string; createdAt: Date; updatedAt: Date }>(
+          COLLECTIONS.userPreferences,
+        )
+        .insertOne({ _id: userId, userId, createdAt: now, updatedAt: now }, options);
     } else {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_USERS
-            SET MOBILE_VERIFIED_AT_UTC = COALESCE(
-                  MOBILE_VERIFIED_AT_UTC, SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                ),
-                UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-          WHERE USER_ID = :userId`,
-        { userId: account.USER_ID },
+      const activate = user.status === 'PENDING';
+      const userUpdate = await users.findOneAndUpdate(
+        { _id: user._id, status: { $in: ['PENDING', 'ACTIVE'] } },
+        {
+          $set: {
+            status: 'ACTIVE',
+            mobileVerifiedAt: user.mobileVerifiedAt ?? now,
+            updatedAt: now,
+          },
+          ...(activate ? { $inc: { authFence: 1 } } : {}),
+        },
+        { ...options, returnDocument: 'after' },
       );
+      if (!userUpdate) return { outcome: 'account_unavailable' };
+      user = userUpdate;
+      participant = await work.db
+        .collection<ParticipantDocument>(COLLECTIONS.participants)
+        .findOne({ userId: user._id, kind: 'USER' }, options);
+      if (!participant) throw new Error('Authenticated account has no financial participant');
     }
 
-    await this.rotateSession(connection, { ...values.session, userId: account.USER_ID });
-
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_AUDIT_EVENTS (
-         AUDIT_EVENT_ID, ACTOR_PARTICIPANT_ID, ACTOR_USER_ID, ACTION_KEY,
-         RESOURCE_TYPE, RESOURCE_ID, REQUEST_ID, IP_ADDRESS_HASH,
-         USER_AGENT_SUMMARY, METADATA_JSON
-       ) VALUES (
-         :auditId, :participantId, :userId, :actionKey,
-         'USER', :userId, :requestId, :ipHash, :userAgent, :metadata
-       )`,
-      {
-        auditId: uuidToRaw(values.auditId),
-        participantId: account.PARTICIPANT_ID,
-        userId: account.USER_ID,
-        actionKey: isNewAccount ? 'account.mobile_register' : 'auth.mobile_login',
-        requestId: values.requestId,
-        ipHash: values.session.ipHash,
-        userAgent: values.session.userAgent.slice(0, 500),
-        metadata: JSON.stringify({ authenticationMethod: 'mobile_otp', isNewAccount }),
-      },
-    );
-
+    await this.rotateSession(work, { ...values.session, userId: user._id });
+    user = { ...user, authFence: user.authFence + 1 };
+    await work.db
+      .collection<{ _id: string } & Record<string, unknown>>(COLLECTIONS.auditEvents)
+      .insertOne(
+        {
+          _id: values.auditId.toLowerCase(),
+          actorParticipantId: participant._id,
+          actorUserId: user._id,
+          actionKey: isNewAccount ? 'account.mobile_register' : 'auth.mobile_login',
+          resourceType: 'USER',
+          resourceId: user._id,
+          requestId: values.requestId,
+          ipAddressHash: Buffer.from(values.session.ipHash),
+          userAgentSummary: values.session.userAgent.slice(0, 500),
+          metadata: { authenticationMethod: 'mobile_otp', isNewAccount },
+          createdAt: now,
+        },
+        options,
+      );
+    const row = await this.loginRow(work, user, participant);
+    if (!row) {
+      throw new Error('Authenticated user was not found after mobile verification.');
+    }
     return {
       outcome: 'authenticated',
       isNewAccount,
-      user: rowToAuthenticatedUser(account),
+      user: rowToAuthenticatedUser(row),
     };
   }
 
-  async rotateSession(connection: Connection, values: SessionValues): Promise<void> {
-    const lockResult = await this.oracle.execute<{ USER_ID: Buffer }>(
-      connection,
-      `SELECT USER_ID
-         FROM SPLITO_USERS
-        WHERE USER_ID = :userId
-          AND STATUS = 'ACTIVE'
-        FOR UPDATE`,
-      { userId: values.userId },
-    );
-    if (!lockResult.rows?.[0]) throw new Error('Session account no longer exists');
-
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_SESSIONS
-          SET REVOKED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-              REVOKED_REASON = 'SINGLE_ACTIVE_LOGIN'
-        WHERE USER_ID = :userId
-          AND REVOKED_AT_UTC IS NULL`,
-      { userId: values.userId },
-    );
-
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_SESSIONS (
-         SESSION_ID, USER_ID, SESSION_TOKEN_HASH, CSRF_SECRET_HASH, DEVICE_NAME,
-         USER_AGENT_SUMMARY, IP_ADDRESS_HASH, EXPIRES_AT_UTC
-       ) VALUES (
-         :sessionId, :userId, :tokenHash, :csrfHash, :deviceName,
-         :userAgent, :ipHash, :expiresAt
-       )`,
+  async rotateSession(work: MongoUnitOfWork, values: SessionValues): Promise<void> {
+    const options = mongoOptions(work);
+    const now = new Date();
+    const user = await work.db
+      .collection<UserDocument>(COLLECTIONS.users)
+      .updateOne(
+        { _id: values.userId, status: 'ACTIVE' },
+        { $inc: { authFence: 1 }, $set: { updatedAt: now } },
+        options,
+      );
+    if (user.matchedCount !== 1) throw new Error('Session account no longer exists');
+    const sessions = work.db.collection<SessionDocument>(COLLECTIONS.sessions);
+    await sessions.replaceOne(
+      { _id: values.userId },
       {
-        sessionId: uuidToRaw(values.sessionId),
+        sessionId: values.sessionId.toLowerCase(),
         userId: values.userId,
-        tokenHash: values.tokenHash,
-        csrfHash: values.csrfHash,
-        deviceName: values.deviceName ?? null,
-        userAgent: values.userAgent.slice(0, 500),
-        ipHash: values.ipHash,
+        sessionTokenHash: Buffer.from(values.tokenHash),
+        csrfSecretHash: Buffer.from(values.csrfHash),
+        ...(values.deviceName ? { deviceName: values.deviceName } : {}),
+        userAgentSummary: values.userAgent.slice(0, 500),
+        ipAddressHash: Buffer.from(values.ipHash),
         expiresAt: values.expiresAt,
+        lastSeenAt: now,
+        active: true,
+        createdAt: now,
+        updatedAt: now,
       },
+      { ...options, upsert: true },
     );
   }
 
   async findSession(tokenHash: Buffer, idleMinutes: number): Promise<AuthContext | undefined> {
-    return this.oracle.withConnection(async (connection) => {
-      const result = await this.oracle.execute<SessionRow>(
-        connection,
-        `SELECT S.SESSION_ID, S.CSRF_SECRET_HASH, U.USER_ID, P.PARTICIPANT_ID,
-                U.EMAIL_NORMALIZED, U.MOBILE_E164, U.DISPLAY_NAME, U.LOCALE_CODE, U.TIMEZONE_NAME,
-                U.DEFAULT_CURRENCY_CODE, U.THEME, U.REDUCED_MOTION_FLAG,
-                AVATAR.MEDIA_ID AS AVATAR_MEDIA_ID,
-                TO_CHAR(U.SECURITY_VERSION) AS VERSION_NO
-           FROM SPLITO_SESSIONS S
-           JOIN SPLITO_USERS U ON U.USER_ID = S.USER_ID
-           JOIN SPLITO_PARTICIPANTS P ON P.USER_ID = U.USER_ID AND P.KIND = 'USER'
-           LEFT JOIN SPLITO_MEDIA_OBJECTS AVATAR
-             ON AVATAR.OWNER_USER_ID = U.USER_ID
-            AND AVATAR.STORAGE_KEY = U.AVATAR_KEY
-            AND AVATAR.MEDIA_KIND = 'USER_AVATAR'
-            AND AVATAR.STATUS = 'ACTIVE'
-          WHERE S.SESSION_TOKEN_HASH = :tokenHash
-            AND S.REVOKED_AT_UTC IS NULL
-            AND S.EXPIRES_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-            AND S.LAST_SEEN_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                - NUMTODSINTERVAL(:idleMinutes, 'MINUTE')
-            AND U.STATUS = 'ACTIVE'`,
-        { tokenHash, idleMinutes },
+    return this.mongo.withConnection(async (work) => {
+      const options = mongoOptions(work);
+      const now = new Date();
+      const idleCutoff = new Date(now.getTime() - idleMinutes * 60 * 1_000);
+      const sessions = work.db.collection<SessionDocument>(COLLECTIONS.sessions);
+      const session = await sessions.findOne(
+        {
+          sessionTokenHash: tokenHash,
+          active: true,
+          expiresAt: { $gt: now },
+          lastSeenAt: { $gt: idleCutoff },
+        },
+        options,
       );
-      const row = result.rows?.[0];
+      if (!session) return undefined;
+      const touched = await sessions.updateOne(
+        {
+          _id: session._id,
+          sessionId: session.sessionId,
+          sessionTokenHash: tokenHash,
+          active: true,
+          expiresAt: { $gt: now },
+          lastSeenAt: { $gt: idleCutoff },
+        },
+        { $set: { lastSeenAt: now, updatedAt: now } },
+        options,
+      );
+      if (touched.matchedCount !== 1) return undefined;
+      const user = await work.db
+        .collection<UserDocument>(COLLECTIONS.users)
+        .findOne({ _id: session.userId, status: 'ACTIVE' }, options);
+      if (!user) return undefined;
+      const row = await this.loginRow(work, user);
       if (!row) return undefined;
-      const touchResult = await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_SESSIONS
-            SET LAST_SEEN_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-          WHERE SESSION_ID = :sessionId
-            AND REVOKED_AT_UTC IS NULL
-            AND EXPIRES_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-            AND LAST_SEEN_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                - NUMTODSINTERVAL(:idleMinutes, 'MINUTE')
-            AND EXISTS (
-              SELECT 1
-                FROM SPLITO_USERS U
-               WHERE U.USER_ID = SPLITO_SESSIONS.USER_ID
-                 AND U.STATUS = 'ACTIVE'
-            )`,
-        { sessionId: row.SESSION_ID, idleMinutes },
-        { autoCommit: true },
-      );
-      if (touchResult.rowsAffected !== 1) return undefined;
       return {
-        sessionId: rawToUuid(row.SESSION_ID),
-        csrfHash: row.CSRF_SECRET_HASH,
+        sessionId: session.sessionId,
+        csrfHash: session.csrfSecretHash,
         user: rowToAuthenticatedUser(row),
       };
     });
   }
 
   async revokeSession(sessionId: string): Promise<void> {
-    await this.oracle.withConnection(async (connection) => {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_SESSIONS
-            SET REVOKED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-                REVOKED_REASON = 'USER_LOGOUT'
-          WHERE SESSION_ID = :sessionId
-            AND REVOKED_AT_UTC IS NULL`,
-        { sessionId: uuidToRaw(sessionId) },
-        { autoCommit: true },
+    await this.mongo.withConnection(async (work) => {
+      const now = new Date();
+      await work.db.collection<SessionDocument>(COLLECTIONS.sessions).updateOne(
+        { sessionId: sessionId.toLowerCase(), active: true },
+        {
+          $set: {
+            active: false,
+            revokedAt: now,
+            revokedReason: 'USER_LOGOUT',
+            updatedAt: now,
+          },
+        },
+        mongoOptions(work),
       );
     });
+  }
+
+  private async loginRow(
+    work: MongoUnitOfWork,
+    user: UserDocument,
+    knownParticipant?: ParticipantDocument,
+  ): Promise<LoginRow | undefined> {
+    const options = mongoOptions(work);
+    const participant =
+      knownParticipant ??
+      (await work.db
+        .collection<ParticipantDocument>(COLLECTIONS.participants)
+        .findOne({ userId: user._id, kind: 'USER' }, options));
+    if (!participant) return undefined;
+    const avatar = user.avatarKey
+      ? await work.db.collection<MediaDocument>(COLLECTIONS.mediaObjects).findOne(
+          {
+            ownerUserId: user._id,
+            storageKey: user.avatarKey,
+            mediaKind: 'USER_AVATAR',
+            status: 'ACTIVE',
+          },
+          options,
+        )
+      : undefined;
+    return {
+      USER_ID: user._id,
+      PARTICIPANT_ID: participant._id,
+      EMAIL_NORMALIZED: user.emailNormalized ?? null,
+      MOBILE_E164: user.mobileE164 ?? null,
+      PASSWORD_HASH: user.passwordHash ?? null,
+      DISPLAY_NAME: user.displayName,
+      LOCALE_CODE: user.localeCode,
+      TIMEZONE_NAME: user.timezoneName,
+      DEFAULT_CURRENCY_CODE: user.defaultCurrencyCode,
+      THEME: user.theme,
+      REDUCED_MOTION_FLAG: user.reducedMotion ? 'Y' : 'N',
+      AVATAR_MEDIA_ID: avatar?._id ?? null,
+      STATUS: user.status,
+      VERSION_NO: String(user.authFence),
+    };
   }
 }

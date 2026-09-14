@@ -1,0 +1,28 @@
+export const COLLECTIONS = {
+  currencies: 'currencies',
+  users: 'users',
+  participants: 'participants',
+  userPreferences: 'userPreferences',
+  authTokens: 'authTokens',
+  sessions: 'sessions',
+  mobileOtpChallenges: 'mobileOtpChallenges',
+  mobileOtpThrottles: 'mobileOtpThrottles',
+  contexts: 'contexts',
+  groups: 'groups',
+  contextMembers: 'contextMembers',
+  invitations: 'invitations',
+  expenses: 'expenses',
+  expenseRevisions: 'expenseRevisions',
+  ledgerBatches: 'ledgerBatches',
+  balanceProjections: 'balanceProjections',
+  bilateralProjections: 'bilateralProjections',
+  settlements: 'settlements',
+  settlementRevisions: 'settlementRevisions',
+  idempotencyKeys: 'idempotencyKeys',
+  idempotencyReceipts: 'idempotencyReceipts',
+  outbox: 'outbox',
+  auditEvents: 'auditEvents',
+  mediaObjects: 'mediaObjects',
+} as const;
+
+export type MongoCollectionName = (typeof COLLECTIONS)[keyof typeof COLLECTIONS];

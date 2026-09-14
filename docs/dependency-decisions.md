@@ -1,6 +1,6 @@
 # Dependency decisions
 
-Decision date: 2026-09-12. Direct dependencies are exact versions in workspace
+Decision date: 2026-09-14. Direct dependencies are exact versions in workspace
 manifests and transitive resolution is pinned by `package-lock.json`. Automated
 weekly proposals do not merge without CI and compatibility review.
 
@@ -25,7 +25,7 @@ still require release-date image vulnerability scanning.
 | NestJS common/core/platform-fastify/swagger | 12.0.1                                                                         | Same release family avoids decorator/platform skew.                                                                                                                                                                |
 | Fastify                                     | 5.12.1                                                                         | `@nestjs/platform-fastify` 12.0.1 resolves/pins this version. Registry-latest 5.12.4 produced duplicate Fastify type universes and plugin incompatibility, so 5.12.1 is the newest mutually compatible direct pin. |
 | Fastify plugins                             | cookie 11.1.2, cors 11.3.0, helmet 13.1.1, multipart 10.1.1, rate-limit 11.2.0 | Maintained Fastify-native packages; no Express middleware. Must remain peer-compatible with Fastify 5.12.1.                                                                                                        |
-| node-oracledb                               | 7.0.1                                                                          | Official driver; Thin mode supports Oracle 12.1+ and the observed 26ai server. Money NUMBER values are fetched as strings.                                                                                         |
+| MongoDB Node.js driver                      | 7.6.0                                                                          | Official driver with native sessions, transactions, BSON `Decimal128`, and binary values. The API and worker share the same exact version.                                                                         |
 | Argon2                                      | 0.45.1                                                                         | Standard Argon2id implementation; deployment needs a supported native build and tuned memory/time benchmarks.                                                                                                      |
 | Sharp                                       | 0.35.4                                                                         | Bounded JPEG/PNG/WebP decoding plus orientation-aware, metadata-stripped WebP normalization for profile/group images. Native libvips builds must remain pinned, audited, and tested on every deployment platform.  |
 | Zod                                         | 4.6.2                                                                          | Shared strict runtime validation.                                                                                                                                                                                  |
@@ -50,21 +50,20 @@ only explicit per-account offline data.
 Production Dockerfiles use Node `24.21.0-bookworm-slim`; static delivery uses
 NGINX `1.30.4-alpine`. Exact tags improve repeatability but tags are mutable;
 release automation should resolve, record, scan, sign, and deploy immutable
-digests. Oracle CI uses the exact supported 26ai-compatible
-`gvenzl/oracle-free:23.26.3-slim-faststart` test image, pinned to its
-`linux/amd64` digest, rather than its rolling `23` alias. Dependabot monitors npm,
-GitHub Actions, and Docker definitions
-weekly.
+digests. MongoDB integration CI uses `mongo:8.0.30-noble` as a single-node
+replica set so transaction behavior is exercised; the exact version tag is still
+mutable and must be resolved and scanned for a production release. Dependabot
+monitors npm, GitHub Actions, and Docker definitions weekly.
 
 Before accepting an update, check official release notes, Node engines, peer
-dependencies, Nest/Fastify plugin compatibility, native Argon2/oracledb support,
-lockfile diff, license change, vulnerabilities, Oracle integration, browser tests,
+dependencies, Nest/Fastify plugin compatibility, native Argon2/Sharp support,
+lockfile diff, license change, vulnerabilities, MongoDB integration, browser tests,
 and financial properties. No production dependency is configured as unrestricted
 `latest`, and prereleases require an explicit decision record.
 
 References:
 
-- [node-oracledb installation/support matrix](https://node-oracledb.readthedocs.io/en/latest/user_guide/installation.html)
-- [node-oracledb Thin/Thick initialization](https://node-oracledb.readthedocs.io/en/stable/user_guide/initialization.html)
-- [Oracle Free test-image supported tags](https://github.com/gvenzl/oci-oracle-free#supported-tags)
+- [MongoDB Node.js driver documentation](https://www.mongodb.com/docs/drivers/node/current/)
+- [MongoDB transactions](https://www.mongodb.com/docs/manual/core/transactions/)
+- [Mongo official container image](https://hub.docker.com/_/mongo)
 - [GitHub Dependabot configuration](https://docs.github.com/en/code-security/concepts/supply-chain-security/about-the-dependabot-yml-file)

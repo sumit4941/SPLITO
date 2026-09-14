@@ -1,8 +1,7 @@
-import type { Connection } from 'oracledb';
 import { describe, expect, it, vi } from 'vitest';
 import { sha256 } from '../auth/auth.crypto.js';
 import type { AuthContext } from '../auth/auth.types.js';
-import type { OracleService } from '../database/oracle.service.js';
+import type { MongoService, MongoUnitOfWork } from '../database/mongo.service.js';
 import type {
   GroupInvitationsRepository,
   ManagedGroup,
@@ -65,7 +64,7 @@ const member: GroupMember = {
 };
 
 function createHarness() {
-  const connection = {} as Connection;
+  const work = {} as MongoUnitOfWork;
   const invitations = {
     lockManagedGroup: vi.fn().mockResolvedValue(managedGroup),
     findRegisteredTarget: vi.fn(),
@@ -82,12 +81,12 @@ function createHarness() {
       inviteUrl: `http://localhost:5173/join#invite=${'x'.repeat(43)}`,
     }),
   };
-  const oracle = {
-    withConnection: vi.fn(async (operation: (value: Connection) => Promise<unknown>) =>
-      operation(connection),
+  const mongo = {
+    withConnection: vi.fn(async (operation: (value: MongoUnitOfWork) => Promise<unknown>) =>
+      operation(work),
     ),
-    withTransaction: vi.fn(async (operation: (value: Connection) => Promise<unknown>) =>
-      operation(connection),
+    withTransaction: vi.fn(async (operation: (value: MongoUnitOfWork) => Promise<unknown>) =>
+      operation(work),
     ),
   };
   return {
@@ -97,7 +96,7 @@ function createHarness() {
       {} as GroupsRepository,
       invitations as unknown as GroupInvitationsRepository,
       sms as unknown as InvitationSmsService,
-      oracle as unknown as OracleService,
+      mongo as unknown as MongoService,
     ),
   };
 }
@@ -166,12 +165,12 @@ describe('group membership and invitation service', () => {
       code: 'GROUP_INVITATION_NOT_FOUND',
       status: 404,
     });
-    const [connection, tokenHash, boundMobile] = invitations.preview.mock.calls[0] as [
-      Connection,
+    const [work, tokenHash, boundMobile] = invitations.preview.mock.calls[0] as [
+      MongoUnitOfWork,
       Buffer,
       string,
     ];
-    expect(connection).toEqual(expect.anything());
+    expect(work).toEqual(expect.anything());
     expect(tokenHash.equals(sha256(token))).toBe(true);
     expect(boundMobile).toBe(auth.user.mobileNumber);
   });

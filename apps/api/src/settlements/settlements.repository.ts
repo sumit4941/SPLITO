@@ -1,10 +1,24 @@
 import { randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
-import type { Connection } from 'oracledb';
-import oracledb from 'oracledb';
-import { OracleService } from '../database/oracle.service.js';
-import { compareUuid, uuidToRaw } from '../database/uuid.js';
+import { Decimal128, type Long } from 'mongodb';
+import { decimalToMinor, minorToDecimal, type MongoUnitOfWork } from '../database/mongo.service.js';
+import { compareUuid } from '../database/uuid.js';
 import type { CreateSettlementInput } from './settlements.schemas.js';
+
+interface BilateralDocument {
+  _id: string;
+  contextId: string;
+  participantLowId: string;
+  participantHighId: string;
+  currencyCode: string;
+  lowOwesHighMinor: Decimal128;
+  version: number | Long;
+}
+
+interface StringIdDocument {
+  _id: string;
+  [key: string]: unknown;
+}
 
 export interface CurrentObligation {
   readonly outstandingMinor: bigint;
@@ -13,50 +27,38 @@ export interface CurrentObligation {
 
 @Injectable()
 export class SettlementsRepository {
-  constructor(private readonly oracle: OracleService) {}
-
   async currentObligation(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly contextId: string;
       readonly senderId: string;
       readonly recipientId: string;
       readonly currency: string;
-      readonly lock: boolean;
     },
   ): Promise<CurrentObligation> {
     const senderIsLow = compareUuid(values.senderId, values.recipientId) < 0;
     const lowId = senderIsLow ? values.senderId : values.recipientId;
     const highId = senderIsLow ? values.recipientId : values.senderId;
-    const result = await this.oracle.execute<{ AMOUNT_MINOR: string; PROJECTION_VERSION: string }>(
-      connection,
-      `SELECT TO_CHAR(LOW_OWES_HIGH_MINOR_SIGNED) AS AMOUNT_MINOR,
-              TO_CHAR(PROJECTION_VERSION) AS PROJECTION_VERSION
-         FROM SPLITO_BILATERAL_PROJECTIONS
-        WHERE CONTEXT_ID = :contextId
-          AND PARTICIPANT_LOW_ID = :lowId
-          AND PARTICIPANT_HIGH_ID = :highId
-          AND CURRENCY_CODE = :currencyCode
-        ${values.lock ? 'FOR UPDATE' : ''}`,
+    const row = await work.db.collection<BilateralDocument>('bilateralProjections').findOne(
       {
-        contextId: uuidToRaw(values.contextId),
-        lowId: uuidToRaw(lowId),
-        highId: uuidToRaw(highId),
+        contextId: values.contextId,
+        participantLowId: lowId,
+        participantHighId: highId,
         currencyCode: values.currency,
       },
+      work.session ? { session: work.session } : undefined,
     );
-    const row = result.rows?.[0];
     if (!row) return { outstandingMinor: 0n, projectionVersion: '0' };
-    const signed = BigInt(row.AMOUNT_MINOR);
+    const signed = decimalToMinor(row.lowOwesHighMinor);
     const senderOwes = senderIsLow ? signed : -signed;
     return {
       outstandingMinor: senderOwes > 0n ? senderOwes : 0n,
-      projectionVersion: row.PROJECTION_VERSION,
+      projectionVersion: row.version.toString(),
     };
   }
 
   async insert(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly input: CreateSettlementInput;
       readonly contextId: string;
@@ -70,148 +72,109 @@ export class SettlementsRepository {
       readonly requestId: string;
     },
   ): Promise<void> {
-    const amountMinor = values.input.amountMinor;
-    const settlementId = uuidToRaw(values.settlementId);
-    const revisionId = uuidToRaw(values.revisionId);
-    const contextId = uuidToRaw(values.contextId);
-    const senderId = uuidToRaw(values.input.senderId);
-    const recipientId = uuidToRaw(values.input.recipientId);
-    const actorParticipantId = uuidToRaw(values.actorParticipantId);
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_SETTLEMENTS (
-         SETTLEMENT_ID, CONTEXT_ID, SENDER_PARTICIPANT_ID, RECIPIENT_PARTICIPANT_ID,
-         CURRENCY_CODE, AMOUNT_MINOR, SETTLEMENT_DATE, BUSINESS_TIMEZONE,
-         METHOD, STATUS, ASSERTION_FLAG, CREATED_BY_PARTICIPANT_ID
-       ) VALUES (
-         :settlementId, :contextId, :senderId, :recipientId,
-         :currencyCode, :amountMinor, TO_DATE(:settlementDate, 'YYYY-MM-DD'),
-         :businessTimezone, :method, 'POSTED', 'Y', :actorParticipantId
-       )`,
+    const now = new Date();
+    const options = work.session ? { session: work.session } : undefined;
+    const amountMinor = minorToDecimal(values.input.amountMinor);
+    await work.db.collection<StringIdDocument>('settlements').insertOne(
       {
-        settlementId,
-        contextId,
-        senderId,
-        recipientId,
+        _id: values.settlementId,
+        contextId: values.contextId,
+        senderParticipantId: values.input.senderId,
+        recipientParticipantId: values.input.recipientId,
         currencyCode: values.input.currency,
         amountMinor,
         settlementDate: values.input.settlementDate,
         businessTimezone: values.businessTimezone,
         method: values.input.method.toUpperCase(),
-        actorParticipantId,
+        status: 'POSTED',
+        assertion: true,
+        currentRevisionId: values.revisionId,
+        version: 1,
+        createdByParticipantId: values.actorParticipantId,
+        createdAt: now,
+        updatedAt: now,
       },
+      options,
     );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_SETTLEMENT_REVISIONS (
-         SETTLEMENT_REVISION_ID, SETTLEMENT_ID, REVISION_NO, AMOUNT_MINOR,
-         METHOD, NOTE_TEXT, CHANGE_TYPE, CREATED_BY_PARTICIPANT_ID
-       ) VALUES (
-         :revisionId, :settlementId, 1, :amountMinor,
-         :method, :noteText, 'CREATE', :actorParticipantId
-       )`,
+    await work.db.collection<StringIdDocument>('settlementRevisions').insertOne(
       {
-        revisionId,
-        settlementId,
+        _id: values.revisionId,
+        settlementId: values.settlementId,
+        revisionNumber: 1,
         amountMinor,
         method: values.input.method.toUpperCase(),
-        noteText: values.input.note ?? null,
-        actorParticipantId,
+        ...(values.input.note ? { note: values.input.note } : {}),
+        changeType: 'CREATE',
+        createdByParticipantId: values.actorParticipantId,
+        createdAt: now,
       },
+      options,
     );
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_SETTLEMENTS
-          SET CURRENT_REVISION_ID = :revisionId
-        WHERE SETTLEMENT_ID = :settlementId`,
-      { revisionId, settlementId },
-    );
-
-    const batchId = uuidToRaw(values.batchId);
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_LEDGER_BATCHES (
-         BATCH_ID, CONTEXT_ID, CURRENCY_CODE, BATCH_TYPE, SOURCE_TYPE,
-         SOURCE_ID, SOURCE_REVISION_ID, IDEMPOTENCY_KEY_ID, ACTOR_PARTICIPANT_ID
-       ) VALUES (
-         :batchId, :contextId, :currencyCode, 'SETTLEMENT', 'SETTLEMENT',
-         :settlementId, :revisionId, :idempotencyId, :actorParticipantId
-       )`,
+    await work.db.collection<StringIdDocument>('ledgerBatches').insertOne(
       {
-        batchId,
-        contextId,
+        _id: values.batchId,
+        contextId: values.contextId,
         currencyCode: values.input.currency,
-        settlementId,
-        revisionId,
-        idempotencyId: uuidToRaw(values.idempotencyId),
-        actorParticipantId,
+        batchType: 'SETTLEMENT',
+        sourceType: 'SETTLEMENT',
+        sourceId: values.settlementId,
+        sourceRevisionId: values.revisionId,
+        idempotencyId: values.idempotencyId,
+        actorParticipantId: values.actorParticipantId,
+        postings: [
+          {
+            id: randomUUID(),
+            participantId: values.input.senderId,
+            amountMinor,
+            postingOrder: 0,
+          },
+          {
+            id: randomUUID(),
+            participantId: values.input.recipientId,
+            amountMinor: minorToDecimal(-BigInt(values.input.amountMinor)),
+            postingOrder: 1,
+          },
+        ],
+        postedAt: now,
       },
+      options,
     );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_LEDGER_POSTINGS (
-         POSTING_ID, BATCH_ID, PARTICIPANT_ID, AMOUNT_MINOR_SIGNED, POSTING_ORDER
-       ) VALUES (:id, :batchId, :participantId, :amountMinor, 0)`,
+    await work.db.collection<StringIdDocument>('outbox').insertOne(
       {
-        id: uuidToRaw(randomUUID()),
-        batchId,
-        participantId: senderId,
-        amountMinor,
-      },
-    );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_LEDGER_POSTINGS (
-         POSTING_ID, BATCH_ID, PARTICIPANT_ID, AMOUNT_MINOR_SIGNED, POSTING_ORDER
-       ) VALUES (:id, :batchId, :participantId, -:amountMinor, 1)`,
-      {
-        id: uuidToRaw(randomUUID()),
-        batchId,
-        participantId: recipientId,
-        amountMinor,
-      },
-    );
-
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_OUTBOX (
-         OUTBOX_ID, EVENT_TYPE, AGGREGATE_TYPE, AGGREGATE_ID, PAYLOAD_JSON
-       ) VALUES (:id, 'settlement.posted', 'SETTLEMENT', :settlementId, :payload)`,
-      {
-        id: uuidToRaw(randomUUID()),
-        settlementId,
+        _id: randomUUID(),
+        eventType: 'settlement.posted',
+        aggregateType: 'SETTLEMENT',
+        aggregateId: values.settlementId,
         payload: {
-          val: JSON.stringify({
-            settlementId: values.settlementId,
-            contextId: values.contextId,
-            invalidation: 'settlements-and-balances',
-          }),
-          type: oracledb.CLOB,
+          settlementId: values.settlementId,
+          contextId: values.contextId,
+          invalidation: 'settlements-and-balances',
         },
+        status: 'PENDING',
+        attempts: 0,
+        availableAt: now,
+        createdAt: now,
       },
+      options,
     );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_AUDIT_EVENTS (
-         AUDIT_EVENT_ID, ACTOR_PARTICIPANT_ID, ACTOR_USER_ID, ACTION_KEY,
-         RESOURCE_TYPE, RESOURCE_ID, CONTEXT_ID, REQUEST_ID, METADATA_JSON
-       ) VALUES (
-         :id, :actorParticipantId, :actorUserId, 'settlement.create',
-         'SETTLEMENT', :settlementId, :contextId, :requestId, :metadata
-       )`,
+    await work.db.collection<StringIdDocument>('auditEvents').insertOne(
       {
-        id: uuidToRaw(randomUUID()),
-        actorParticipantId,
-        actorUserId: uuidToRaw(values.actorUserId),
-        settlementId,
-        contextId,
+        _id: randomUUID(),
+        actorParticipantId: values.actorParticipantId,
+        actorUserId: values.actorUserId,
+        actionKey: 'settlement.create',
+        resourceType: 'SETTLEMENT',
+        resourceId: values.settlementId,
+        contextId: values.contextId,
         requestId: values.requestId,
-        metadata: JSON.stringify({
+        metadata: {
           currency: values.input.currency,
           method: values.input.method,
           userAssertion: true,
-        }),
+        },
+        createdAt: now,
       },
+      options,
     );
   }
 }

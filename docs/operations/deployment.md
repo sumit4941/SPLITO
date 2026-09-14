@@ -1,21 +1,25 @@
 # Deployment guide
 
-The provided images package API, worker, and static web services. Oracle remains
-external; `compose.yaml` intentionally does not start or replace the installed
-database.
+The provided images package API, worker, and static web services. Production
+MongoDB remains external. The optional `local-db` Compose profile starts a
+loopback-only single-node replica set for host-based development, not production.
 
 ## Build and release
 
-1. Run the complete CI and Oracle integration workflow on the release commit.
+1. Run the complete CI and MongoDB integration workflow on the release commit.
 2. Resolve high/critical dependency and container findings or record narrow,
    expiring risk acceptance. Generate an SBOM and sign immutable image digests in
    the delivery platform.
 3. Back up and validate recovery, then apply migrations as a separate one-shot
-   release action using only the owner credential.
-4. Deploy the API with only `SPLITO_APP` and the static web image without
-   database/provider secrets. Deploy a worker image only after real production
-   handlers are registered; the current development log sink deliberately
-   refuses to start in production.
+   release action using a database-scoped user with `readWrite` plus `dbAdmin`
+   (or a narrower custom role including `collMod`). Remove that credential when
+   the job ends.
+4. Deploy the API with its collection-scoped MongoDB user, including read-only
+   `listCollections`/`listIndexes` for startup schema verification, and the
+   static web image without database/provider secrets. Deploy a worker with its
+   distinct outbox-scoped user only after real production handlers are
+   registered; the current development log sink deliberately refuses to start
+   in production.
 5. Run readiness, API/UI smoke, authorization, and financial reconciliation
    checks. Monitor before increasing traffic.
 
@@ -49,27 +53,25 @@ origin, and `COOKIE_SECURE=true`, which are also enforced by runtime validation.
 
 ## Required secret/config separation
 
-- API: runtime database password, independent session and OTP peppers, CSRF
+- API: `MONGODB_URI`, independent session and OTP peppers, CSRF
   secret, MFA envelope-encryption key reference, and only the adapter secrets
   it uses.
-- Worker: runtime database password plus only its polling/logging configuration
+- Worker: `MONGODB_URI` plus only its polling/logging configuration
   and activated adapter secrets. It does not receive browser-authentication or
   bootstrap/migration secrets.
-- Migration job: owner password only; no session/provider secrets.
-- Bootstrap job: temporary DBA password plus new user secrets; remove immediately
-  after use.
+- Migration job: a database-scoped MongoDB credential with data plus collection,
+  index, and validator-management privileges; no session/provider secrets.
 - Web image: no secrets. Vite values are public by construction.
 
 Prefer workload identity and a platform secret manager. Mount/inject secrets at
 runtime, prevent them from appearing in image layers, Compose files, shell
-history, crash reports, metrics, or logs, and document rotation. Rotate the
-shared administrator credential before non-local use.
+history, crash reports, metrics, or logs, and document rotation. Rotate any
+database credential disclosed outside the secret manager.
 
 Compose uses `.env` only for variable interpolation and explicitly allowlists
-each service environment. It never bulk-injects that file: administrator and
-owner variables therefore cannot leak into the API or worker merely because an
-operator used them during setup. Keep the bootstrap outside regular deployment;
-the one-shot migration profile receives only its `SPLITO_MIGRATION_*` values.
+each service environment. It never bulk-injects that file. The one-shot
+migration profile receives the MongoDB connection variables but no browser or
+provider secrets.
 
 ## Storage/providers
 
@@ -98,9 +100,9 @@ Use the detailed [private-storage](private-storage.md) and
 
 ## Scaling
 
-API replicas are stateless. Multiply `DATABASE_POOL_MAX` by all API and worker
-replicas and keep the result inside the DBA-approved connection budget. Workers
-coordinate through Oracle leases; keep clocks synchronized and leases longer
+API replicas are stateless. Multiply `MONGODB_MAX_POOL_SIZE` by all API and worker
+replicas and keep the result inside the Atlas connection budget. Workers
+coordinate through MongoDB leases; keep clocks synchronized and leases longer
 than expected transaction work but shorter than alerting thresholds. Drain API
 requests and worker leases during shutdown. Autoscale on sustained latency,
 queue depth, and pool pressure—not CPU alone.

@@ -1,6 +1,6 @@
 # Vercel web deployment
 
-SPLITO's React PWA is configured for Vercel. The current API, Oracle database,
+SPLITO's React PWA is configured for Vercel. The current API, MongoDB database,
 outbox worker, and private media implementation are not all suitable for the
 same Vercel deployment, so the supported boundary is:
 
@@ -8,10 +8,10 @@ same Vercel deployment, so the supported boundary is:
 Browser
   |-- / and application routes --> Vercel static PWA
   `-- /api/* --------------------> Vercel rewrite --> HTTPS API service
-                                                       |-- Oracle
+                                                       |-- MongoDB Atlas
                                                        `-- private object storage
 
-Always-on worker -------------------------------------> Oracle/outbox/providers
+Always-on worker -------------------------------------> MongoDB/outbox/providers
 ```
 
 The external rewrite keeps every browser request on the visible web origin.
@@ -20,8 +20,8 @@ CSRF cookie design. Keep `VITE_API_BASE_URL` unset in Vercel.
 
 ## Before importing the Git repository
 
-1. Deploy the API to durable container compute near the managed Oracle service.
-   The API origin must be reachable over HTTPS. Do not expose Oracle directly to
+1. Deploy the API to durable container compute near the MongoDB Atlas cluster.
+   The API origin must be reachable over HTTPS. Do not expose MongoDB directly to
    the browser or run migrations as part of a web build.
 2. Configure production private object storage and scanning before enabling
    profile or group image uploads. The current filesystem adapter deliberately
@@ -64,14 +64,14 @@ COOKIE_SECURE=true
 ```
 
 Leave `COOKIE_DOMAIN` unset. Supply the independent session, CSRF, OTP, and MFA
-secrets, least-privilege Oracle configuration, and complete Twilio API-key plus
+secrets, a least-privilege `MONGODB_URI`, and complete Twilio API-key plus
 exactly one sender configuration through the backend platform's secret manager.
 Set `TRUST_PROXY=true` only if that service can receive traffic solely through a
 trusted proxy that overwrites forwarding headers.
 
 Invitation links are generated from `WEB_ORIGIN`, so change it to the final
 custom domain before the release smoke test. When database ingress uses an IP
-allowlist, use a backend platform with controlled egress and Oracle TCPS/mTLS.
+access list, use a backend platform with controlled egress or an Atlas private endpoint.
 
 ## Verification and release
 
@@ -97,7 +97,7 @@ backend directly:
    member addition, and creator-only expense edits against staging resources.
 4. Confirm `/api/*` responses are never cached and private images are not stored
    by the service worker or public CDN.
-5. Exercise Oracle cold start, pool exhaustion, database outage, and rolling
+5. Exercise MongoDB cold start, pool exhaustion, primary failover, database outage, and rolling
    release behavior before increasing traffic.
 
 Do not mark the whole product production-ready until the open provider, worker,

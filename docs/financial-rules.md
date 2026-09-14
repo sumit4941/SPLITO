@@ -8,11 +8,12 @@ server remains authoritative.
 
 - A money value is `{ currency, amountMinor }`, where `amountMinor` is a base-10
   integer string at JSON boundaries and a `BigInt` internally.
-- The domain and Oracle bound is `0..9,999,999,999,999,999,999` for unsigned
+- The domain and persistence bound is `0..9,999,999,999,999,999,999` for unsigned
   document/allocation amounts. Signed postings use the corresponding negative
-  bound. Values outside it are rejected before SQL.
-- `NUMBER(19,0)` is fetched as text. No financial path converts it to a binary
-  floating-point JavaScript `Number`.
+  bound. Values outside it are rejected before persistence.
+- MongoDB stores integer minor units in BSON `Decimal128`. Repository helpers
+  convert them to `BigInt`; no authoritative financial path converts them to a
+  binary floating-point JavaScript `Number`.
 - Currency metadata defines zero, two, or three decimal places. Formatting never
   changes stored minor units.
 - Percentages, shares, adjustments, quantities, and rates are parsed as decimal
@@ -30,7 +31,7 @@ sum(net[i]) = 0
 
 Positive net means receivable; negative net means payable. Participants with
 zero net are retained in the revision allocation but omitted from ledger
-postings because `SPLITO_LEDGER_POSTINGS` forbids meaningless zero rows.
+postings because meaningless zero journal entries are omitted.
 
 ## Deterministic largest remainder v1
 
@@ -90,7 +91,7 @@ unbalanced batches.
 For the implemented expense replacement route, read and write permissions are
 deliberately different. Every active member of the group may see the current
 expense, creator, payers, and allocations. Only the participant recorded in
-`SPLITO_EXPENSES.CREATED_BY_PARTICIPANT_ID` may replace it, and that participant
+`expenses.createdByParticipantId` may replace it, and that participant
 must still have active membership while the context and expense are writable.
 Being a group owner, administrator, payer, or beneficiary does not grant edit
 authority. The response's `canEdit` flag is computed from these server-side
@@ -115,8 +116,8 @@ or deleted. A stale fresh request returns `412`. An identical retry with the
 same completed idempotency key returns the stored outcome without a second
 revision or journal effect; reuse of that key with different input is a
 conflict. Focused unit tests exercise this orchestration and authorization. The
-post-V006 live Oracle smoke flow, projection reconciliation, Oracle-backed
-worker integration, and complete repository verification pipeline also pass.
+MongoDB migration, reconciliation, and worker integration checks must pass on a
+replica-set test database before this becomes release evidence.
 
 Settlements are transfers, not spending. For `S` sent from A to B, A receives a
 `+S` net posting and B receives `−S`. A manual record is explicitly a user

@@ -2,29 +2,40 @@ import { describe, expect, it } from 'vitest';
 import { loadEnvironment, loadWorkerEnvironment } from './index.js';
 
 describe('runtime configuration', () => {
-  it('uses bounded Oracle Thin-mode-friendly defaults for development', () => {
+  const productionMongoUri =
+    'mongodb+srv://app-user:placeholder@cluster.example.mongodb.net/?retryWrites=true&w=majority';
+
+  it('uses bounded MongoDB replica-set defaults for development', () => {
     const config = loadEnvironment({});
-    expect(config.DATABASE_CONNECT_STRING).toBe('localhost:1521/FREEPDB1');
-    expect(config.DATABASE_USER).toBe('SPLITO_APP');
-    expect(config.DATABASE_OWNER_SCHEMA).toBe('SPLITO_OWNER');
-    expect(config.DATABASE_POOL_MIN).toBeLessThanOrEqual(config.DATABASE_POOL_MAX);
+    expect(config.MONGODB_URI).toBe('mongodb://127.0.0.1:27017/?replicaSet=rs0');
+    expect(config.MONGODB_DATABASE).toBe('splito');
+    expect(config.MONGODB_MIN_POOL_SIZE).toBeLessThanOrEqual(config.MONGODB_MAX_POOL_SIZE);
   });
 
   it('rejects an inverted connection pool', () => {
-    expect(() => loadEnvironment({ DATABASE_POOL_MIN: '9', DATABASE_POOL_MAX: '2' })).toThrow(
-      /DATABASE_POOL_MIN cannot exceed DATABASE_POOL_MAX/u,
+    expect(() =>
+      loadEnvironment({ MONGODB_MIN_POOL_SIZE: '9', MONGODB_MAX_POOL_SIZE: '2' }),
+    ).toThrow(/MONGODB_MIN_POOL_SIZE cannot exceed MONGODB_MAX_POOL_SIZE/u);
+  });
+
+  it('rejects invalid MongoDB connection settings', () => {
+    expect(() => loadEnvironment({ MONGODB_URI: 'https://database.example' })).toThrow(
+      /MONGODB_URI must use mongodb/u,
+    );
+    expect(() => loadEnvironment({ MONGODB_DATABASE: 'splito/production' })).toThrow(
+      /MONGODB_DATABASE/u,
     );
   });
 
   it('fails closed when production secrets or secure cookies are missing', () => {
-    expect(() => loadEnvironment({ NODE_ENV: 'production' })).toThrow(/DATABASE_PASSWORD/u);
+    expect(() => loadEnvironment({ NODE_ENV: 'production' })).toThrow(/MONGODB_URI/u);
   });
 
   it('accepts an independently supplied production security configuration', () => {
     const config = loadEnvironment({
       NODE_ENV: 'production',
       COOKIE_SECURE: 'true',
-      DATABASE_PASSWORD: 'database-password-long',
+      MONGODB_URI: productionMongoUri,
       SESSION_PEPPER: 's'.repeat(32),
       CSRF_SECRET: 'c'.repeat(32),
       OTP_PEPPER: 'o'.repeat(32),
@@ -60,7 +71,7 @@ describe('runtime configuration', () => {
       loadEnvironment({
         NODE_ENV: 'production',
         COOKIE_SECURE: 'true',
-        DATABASE_PASSWORD: 'database-password-long',
+        MONGODB_URI: productionMongoUri,
         SESSION_PEPPER: 's'.repeat(32),
         CSRF_SECRET: 'c'.repeat(32),
         OTP_PEPPER: 'o'.repeat(32),
@@ -68,13 +79,6 @@ describe('runtime configuration', () => {
         WEB_ORIGIN: 'https://app.splito.example',
       }),
     ).toThrow(/SMS_PROVIDER must be twilio in production/u);
-  });
-
-  it('rejects an Oracle owner or administrative account as the runtime identity', () => {
-    expect(() =>
-      loadEnvironment({ DATABASE_USER: 'SPLITO_OWNER', DATABASE_OWNER_SCHEMA: 'SPLITO_OWNER' }),
-    ).toThrow(/least-privilege runtime account/u);
-    expect(() => loadEnvironment({ DATABASE_USER: 'SYSTEM' })).toThrow(/administrative account/u);
   });
 
   it('requires independent application secrets', () => {
@@ -91,7 +95,7 @@ describe('runtime configuration', () => {
       loadEnvironment({
         NODE_ENV: 'production',
         COOKIE_SECURE: 'true',
-        DATABASE_PASSWORD: 'database-password-long',
+        MONGODB_URI: productionMongoUri,
         SESSION_PEPPER: 's'.repeat(32),
         CSRF_SECRET: 'c'.repeat(32),
         MFA_ENCRYPTION_KEY: 'a'.repeat(64),
@@ -105,7 +109,7 @@ describe('runtime configuration', () => {
       loadEnvironment({
         NODE_ENV: 'production',
         COOKIE_SECURE: 'true',
-        DATABASE_PASSWORD: 'database-password-long',
+        MONGODB_URI: productionMongoUri,
         SESSION_PEPPER: 's'.repeat(32),
         CSRF_SECRET: 'c'.repeat(32),
         OTP_PEPPER: 'o'.repeat(32),
@@ -114,12 +118,12 @@ describe('runtime configuration', () => {
     ).toThrow(/WEB_ORIGIN must use HTTPS/u);
   });
 
-  it('keeps production worker secrets limited to its Oracle credential', () => {
+  it('keeps production worker secrets limited to its MongoDB connection', () => {
     const config = loadWorkerEnvironment({
       NODE_ENV: 'production',
-      DATABASE_PASSWORD: 'worker-database-password',
+      MONGODB_URI: productionMongoUri,
     });
-    expect(config.DATABASE_PASSWORD).toBe('worker-database-password');
+    expect(config.MONGODB_URI).toBe(productionMongoUri);
     expect(config.SESSION_PEPPER).toBeUndefined();
     expect(config.CSRF_SECRET).toBeUndefined();
     expect(config.OTP_PEPPER).toBeUndefined();
@@ -127,9 +131,15 @@ describe('runtime configuration', () => {
     expect(config.COOKIE_SECURE).toBe(false);
   });
 
-  it('still requires the Oracle credential for a production worker', () => {
+  it('requires a non-local MongoDB deployment for a production worker', () => {
     expect(() => loadWorkerEnvironment({ NODE_ENV: 'production' })).toThrow(
-      /DATABASE_PASSWORD is required in production/u,
+      /MONGODB_URI must point to a non-local deployment/u,
     );
+    expect(() =>
+      loadWorkerEnvironment({
+        NODE_ENV: 'production',
+        MONGODB_URI: 'mongodb://app-user:placeholder@localhost:27017/?replicaSet=rs0',
+      }),
+    ).toThrow(/MONGODB_URI must point to a non-local deployment/u);
   });
 });

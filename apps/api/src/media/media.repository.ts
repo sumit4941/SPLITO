@@ -1,26 +1,64 @@
 import { Injectable } from '@nestjs/common';
-import type { Connection } from 'oracledb';
 import { ApiError } from '../common/api-error.js';
-import { OracleService } from '../database/oracle.service.js';
-import { rawToUuid, uuidToRaw } from '../database/uuid.js';
+import {
+  COLLECTIONS,
+  MongoService,
+  mongoOptions,
+  type MongoUnitOfWork,
+} from '../database/mongo.service.js';
 import type { MediaKind, MediaObject, ProcessedImage } from './media.types.js';
 
-interface MediaRow {
-  MEDIA_ID: Buffer;
-  STORAGE_KEY: string;
-  MEDIA_TYPE: 'image/webp';
-  BYTE_SIZE: string;
-  SHA256_HASH: Buffer;
-  WIDTH_PX: string;
-  HEIGHT_PX: string;
+interface UserDocument {
+  _id: string;
+  status: 'PENDING' | 'ACTIVE' | 'LOCKED' | 'DELETION_PENDING' | 'ANONYMIZED';
+  avatarKey?: string;
+  updatedAt: Date;
 }
 
-interface CurrentImageRow {
-  CURRENT_STORAGE_KEY: string | null;
+interface ParticipantDocument {
+  _id: string;
+  userId?: string;
+  kind: 'USER' | 'GUEST';
 }
 
-interface CurrentGroupImageRow extends CurrentImageRow {
-  CONTEXT_ID: Buffer;
+interface ContextMemberDocument {
+  _id: string;
+  contextId: string;
+  participantId: string;
+  status: 'ACTIVE' | 'FORMER';
+}
+
+interface GroupDocument {
+  _id: string;
+  contextId: string;
+  imageKey?: string;
+  updatedAt: Date;
+}
+
+interface ContextDocument {
+  _id: string;
+  mutationVersion: number;
+  updatedAt: Date;
+}
+
+interface MediaDocument {
+  _id: string;
+  mediaKind: MediaKind;
+  ownerUserId?: string;
+  ownerGroupId?: string;
+  uploadedByParticipantId: string;
+  storageProvider: 'FILESYSTEM';
+  storageKey: string;
+  mediaType: 'image/webp';
+  byteSize: number;
+  sha256Hash: Buffer;
+  widthPixels: number;
+  heightPixels: number;
+  status: 'ACTIVE' | 'SUPERSEDED' | 'DELETED';
+  supersededAt?: Date;
+  deletedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export interface NewMediaValues {
@@ -33,138 +71,138 @@ export interface NewMediaValues {
   readonly requestId: string;
 }
 
-function mapMedia(row: MediaRow): MediaObject {
+function mapMedia(document: MediaDocument): MediaObject {
   return {
-    id: rawToUuid(row.MEDIA_ID),
-    storageKey: row.STORAGE_KEY,
-    mediaType: row.MEDIA_TYPE,
-    byteSize: Number(row.BYTE_SIZE),
-    sha256Hash: row.SHA256_HASH,
-    width: Number(row.WIDTH_PX),
-    height: Number(row.HEIGHT_PX),
+    id: document._id,
+    storageKey: document.storageKey,
+    mediaType: document.mediaType,
+    byteSize: document.byteSize,
+    sha256Hash: Buffer.from(document.sha256Hash),
+    width: document.widthPixels,
+    height: document.heightPixels,
   };
 }
 
 @Injectable()
 export class MediaRepository {
-  constructor(private readonly oracle: OracleService) {}
+  constructor(private readonly mongo: MongoService) {}
 
   async findParticipantAvatar(
-    connection: Connection,
+    work: MongoUnitOfWork,
     participantId: string,
     callerParticipantId: string,
     mediaId: string,
   ): Promise<MediaObject | undefined> {
-    const result = await this.oracle.execute<MediaRow>(
-      connection,
-      `SELECT MO.MEDIA_ID, MO.STORAGE_KEY, MO.MEDIA_TYPE,
-              TO_CHAR(MO.BYTE_SIZE) AS BYTE_SIZE, MO.SHA256_HASH,
-              TO_CHAR(MO.WIDTH_PX) AS WIDTH_PX, TO_CHAR(MO.HEIGHT_PX) AS HEIGHT_PX
-         FROM SPLITO_PARTICIPANTS TARGET_P
-         JOIN SPLITO_USERS TARGET_U
-           ON TARGET_U.USER_ID = TARGET_P.USER_ID
-          AND TARGET_U.STATUS = 'ACTIVE'
-         JOIN SPLITO_MEDIA_OBJECTS MO
-           ON MO.OWNER_USER_ID = TARGET_U.USER_ID
-          AND MO.STORAGE_KEY = TARGET_U.AVATAR_KEY
-          AND MO.MEDIA_KIND = 'USER_AVATAR'
-          AND MO.STATUS = 'ACTIVE'
-        WHERE TARGET_P.PARTICIPANT_ID = :participantId
-          AND MO.MEDIA_ID = :mediaId
-          AND (
-            TARGET_P.PARTICIPANT_ID = :callerParticipantId OR
-            EXISTS (
-              SELECT 1
-                FROM SPLITO_CONTEXT_MEMBERS CALLER_M
-                JOIN SPLITO_CONTEXT_MEMBERS TARGET_M
-                  ON TARGET_M.CONTEXT_ID = CALLER_M.CONTEXT_ID
-                 AND TARGET_M.PARTICIPANT_ID = TARGET_P.PARTICIPANT_ID
-                 AND TARGET_M.STATUS = 'ACTIVE'
-               WHERE CALLER_M.PARTICIPANT_ID = :callerParticipantId
-                 AND CALLER_M.STATUS = 'ACTIVE'
-            )
-          )`,
+    const options = mongoOptions(work);
+    const target = await work.db
+      .collection<ParticipantDocument>(COLLECTIONS.participants)
+      .findOne({ _id: participantId.toLowerCase(), kind: 'USER' }, options);
+    if (!target?.userId) return undefined;
+    const user = await work.db
+      .collection<UserDocument>(COLLECTIONS.users)
+      .findOne({ _id: target.userId, status: 'ACTIVE' }, options);
+    if (!user?.avatarKey) return undefined;
+    const callerId = callerParticipantId.toLowerCase();
+    if (target._id !== callerId) {
+      const callerMemberships = await work.db
+        .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+        .find({ participantId: callerId, status: 'ACTIVE' }, options)
+        .project<{ contextId: string }>({ contextId: 1 })
+        .toArray();
+      if (callerMemberships.length === 0) return undefined;
+      const shared = await work.db
+        .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+        .findOne(
+          {
+            participantId: target._id,
+            status: 'ACTIVE',
+            contextId: { $in: callerMemberships.map((membership) => membership.contextId) },
+          },
+          options,
+        );
+      if (!shared) return undefined;
+    }
+    const media = await work.db.collection<MediaDocument>(COLLECTIONS.mediaObjects).findOne(
       {
-        participantId: uuidToRaw(participantId),
-        callerParticipantId: uuidToRaw(callerParticipantId),
-        mediaId: uuidToRaw(mediaId),
+        _id: mediaId.toLowerCase(),
+        ownerUserId: user._id,
+        storageKey: user.avatarKey,
+        mediaKind: 'USER_AVATAR',
+        status: 'ACTIVE',
       },
+      options,
     );
-    const row = result.rows?.[0];
-    return row ? mapMedia(row) : undefined;
+    return media ? mapMedia(media) : undefined;
   }
 
   async findGroupImage(
-    connection: Connection,
+    work: MongoUnitOfWork,
     groupId: string,
     callerParticipantId: string,
     mediaId: string,
   ): Promise<MediaObject | undefined> {
-    const result = await this.oracle.execute<MediaRow>(
-      connection,
-      `SELECT MO.MEDIA_ID, MO.STORAGE_KEY, MO.MEDIA_TYPE,
-              TO_CHAR(MO.BYTE_SIZE) AS BYTE_SIZE, MO.SHA256_HASH,
-              TO_CHAR(MO.WIDTH_PX) AS WIDTH_PX, TO_CHAR(MO.HEIGHT_PX) AS HEIGHT_PX
-         FROM SPLITO_GROUPS G
-         JOIN SPLITO_CONTEXT_MEMBERS CALLER_M
-           ON CALLER_M.CONTEXT_ID = G.CONTEXT_ID
-          AND CALLER_M.PARTICIPANT_ID = :callerParticipantId
-          AND CALLER_M.STATUS = 'ACTIVE'
-         JOIN SPLITO_MEDIA_OBJECTS MO
-           ON MO.OWNER_GROUP_ID = G.GROUP_ID
-          AND MO.STORAGE_KEY = G.IMAGE_KEY
-          AND MO.MEDIA_KIND = 'GROUP_IMAGE'
-          AND MO.STATUS = 'ACTIVE'
-        WHERE G.GROUP_ID = :groupId
-          AND MO.MEDIA_ID = :mediaId`,
+    const options = mongoOptions(work);
+    const group = await work.db
+      .collection<GroupDocument>(COLLECTIONS.groups)
+      .findOne({ _id: groupId.toLowerCase() }, options);
+    if (!group?.imageKey) return undefined;
+    const membership = await work.db
+      .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+      .findOne(
+        {
+          contextId: group.contextId,
+          participantId: callerParticipantId.toLowerCase(),
+          status: 'ACTIVE',
+        },
+        options,
+      );
+    if (!membership) return undefined;
+    const media = await work.db.collection<MediaDocument>(COLLECTIONS.mediaObjects).findOne(
       {
-        groupId: uuidToRaw(groupId),
-        callerParticipantId: uuidToRaw(callerParticipantId),
-        mediaId: uuidToRaw(mediaId),
+        _id: mediaId.toLowerCase(),
+        ownerGroupId: group._id,
+        storageKey: group.imageKey,
+        mediaKind: 'GROUP_IMAGE',
+        status: 'ACTIVE',
       },
+      options,
     );
-    const row = result.rows?.[0];
-    return row ? mapMedia(row) : undefined;
+    return media ? mapMedia(media) : undefined;
   }
 
   async replaceUserAvatar(
-    connection: Connection,
+    work: MongoUnitOfWork,
     userId: string,
     values: NewMediaValues,
   ): Promise<string | undefined> {
-    const selected = await this.oracle.execute<CurrentImageRow>(
-      connection,
-      `SELECT AVATAR_KEY AS CURRENT_STORAGE_KEY
-         FROM SPLITO_USERS
-        WHERE USER_ID = :userId
-          AND STATUS = 'ACTIVE'
-        FOR UPDATE`,
-      { userId: uuidToRaw(userId) },
-    );
-    const current = selected.rows?.[0];
-    if (!current) {
+    const options = mongoOptions(work);
+    const users = work.db.collection<UserDocument>(COLLECTIONS.users);
+    const user = await users.findOne({ _id: userId.toLowerCase(), status: 'ACTIVE' }, options);
+    if (!user) {
       throw new ApiError(409, 'ACCOUNT_UNAVAILABLE', 'The account cannot be changed.');
     }
-    await this.supersede(connection, current.CURRENT_STORAGE_KEY);
-    await this.insertMedia(connection, 'USER_AVATAR', values, { userId });
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_USERS
-          SET AVATAR_KEY = :storageKey,
-              UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE USER_ID = :userId`,
-      { storageKey: values.storageKey, userId: uuidToRaw(userId) },
+    await this.supersede(work, user.avatarKey);
+    await this.insertMedia(work, 'USER_AVATAR', values, { userId: user._id });
+    const updated = await users.updateOne(
+      {
+        _id: user._id,
+        status: 'ACTIVE',
+        ...(user.avatarKey ? { avatarKey: user.avatarKey } : { avatarKey: { $exists: false } }),
+      },
+      { $set: { avatarKey: values.storageKey, updatedAt: new Date() } },
+      options,
     );
-    await this.audit(connection, values, {
+    if (updated.modifiedCount !== 1) throw new Error('Profile image reference was not updated');
+    await this.audit(work, values, {
       action: 'profile.avatar.replace',
       resourceType: 'USER',
-      resourceId: userId,
+      resourceId: user._id,
     });
-    return current.CURRENT_STORAGE_KEY ?? undefined;
+    return user.avatarKey;
   }
 
   async deleteUserAvatar(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly userId: string;
       readonly actorParticipantId: string;
@@ -173,66 +211,62 @@ export class MediaRepository {
       readonly requestId: string;
     },
   ): Promise<string | undefined> {
-    const selected = await this.oracle.execute<CurrentImageRow>(
-      connection,
-      `SELECT AVATAR_KEY AS CURRENT_STORAGE_KEY
-         FROM SPLITO_USERS
-        WHERE USER_ID = :userId
-          AND STATUS = 'ACTIVE'
-        FOR UPDATE`,
-      { userId: uuidToRaw(values.userId) },
+    const options = mongoOptions(work);
+    const users = work.db.collection<UserDocument>(COLLECTIONS.users);
+    const user = await users.findOne(
+      { _id: values.userId.toLowerCase(), status: 'ACTIVE' },
+      options,
     );
-    const current = selected.rows?.[0];
-    if (!current) {
+    if (!user) {
       throw new ApiError(409, 'ACCOUNT_UNAVAILABLE', 'The account cannot be changed.');
     }
-    if (!current.CURRENT_STORAGE_KEY) return undefined;
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_USERS
-          SET AVATAR_KEY = NULL,
-              UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE USER_ID = :userId`,
-      { userId: uuidToRaw(values.userId) },
+    if (!user.avatarKey) return undefined;
+    const updated = await users.updateOne(
+      { _id: user._id, status: 'ACTIVE', avatarKey: user.avatarKey },
+      { $unset: { avatarKey: '' }, $set: { updatedAt: new Date() } },
+      options,
     );
-    await this.markDeleted(connection, current.CURRENT_STORAGE_KEY);
-    await this.audit(connection, values, {
+    if (updated.modifiedCount !== 1) throw new Error('Profile image reference was not removed');
+    await this.markDeleted(work, user.avatarKey);
+    await this.audit(work, values, {
       action: 'profile.avatar.delete',
       resourceType: 'USER',
-      resourceId: values.userId,
+      resourceId: user._id,
     });
-    return current.CURRENT_STORAGE_KEY;
+    return user.avatarKey;
   }
 
   async replaceGroupImage(
-    connection: Connection,
+    work: MongoUnitOfWork,
     groupId: string,
     contextId: string,
     values: NewMediaValues,
   ): Promise<string | undefined> {
-    const current = await this.lockGroup(connection, groupId);
-    await this.supersede(connection, current.CURRENT_STORAGE_KEY);
-    await this.insertMedia(connection, 'GROUP_IMAGE', values, { groupId });
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_GROUPS
-          SET IMAGE_KEY = :storageKey,
-              UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE GROUP_ID = :groupId`,
-      { storageKey: values.storageKey, groupId: uuidToRaw(groupId) },
+    const options = mongoOptions(work);
+    const group = await this.requireGroup(work, groupId);
+    await this.bumpContextVersion(work, contextId);
+    await this.supersede(work, group.imageKey);
+    await this.insertMedia(work, 'GROUP_IMAGE', values, { groupId: group._id });
+    const updated = await work.db.collection<GroupDocument>(COLLECTIONS.groups).updateOne(
+      {
+        _id: group._id,
+        ...(group.imageKey ? { imageKey: group.imageKey } : { imageKey: { $exists: false } }),
+      },
+      { $set: { imageKey: values.storageKey, updatedAt: new Date() } },
+      options,
     );
-    await this.bumpContextVersion(connection, contextId);
-    await this.audit(connection, values, {
+    if (updated.modifiedCount !== 1) throw new Error('Group image reference was not updated');
+    await this.audit(work, values, {
       action: 'group.image.replace',
       resourceType: 'GROUP',
-      resourceId: groupId,
+      resourceId: group._id,
       contextId,
     });
-    return current.CURRENT_STORAGE_KEY ?? undefined;
+    return group.imageKey;
   }
 
   async deleteGroupImage(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly groupId: string;
       readonly contextId: string;
@@ -242,120 +276,110 @@ export class MediaRepository {
       readonly requestId: string;
     },
   ): Promise<string | undefined> {
-    const current = await this.lockGroup(connection, values.groupId);
-    if (!current.CURRENT_STORAGE_KEY) return undefined;
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_GROUPS
-          SET IMAGE_KEY = NULL,
-              UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE GROUP_ID = :groupId`,
-      { groupId: uuidToRaw(values.groupId) },
-    );
-    await this.markDeleted(connection, current.CURRENT_STORAGE_KEY);
-    await this.bumpContextVersion(connection, values.contextId);
-    await this.audit(connection, values, {
+    const options = mongoOptions(work);
+    const group = await this.requireGroup(work, values.groupId);
+    if (!group.imageKey) return undefined;
+    await this.bumpContextVersion(work, values.contextId);
+    const updated = await work.db
+      .collection<GroupDocument>(COLLECTIONS.groups)
+      .updateOne(
+        { _id: group._id, imageKey: group.imageKey },
+        { $unset: { imageKey: '' }, $set: { updatedAt: new Date() } },
+        options,
+      );
+    if (updated.modifiedCount !== 1) throw new Error('Group image reference was not removed');
+    await this.markDeleted(work, group.imageKey);
+    await this.audit(work, values, {
       action: 'group.image.delete',
       resourceType: 'GROUP',
-      resourceId: values.groupId,
+      resourceId: group._id,
       contextId: values.contextId,
     });
-    return current.CURRENT_STORAGE_KEY;
+    return group.imageKey;
   }
 
-  private async lockGroup(connection: Connection, groupId: string): Promise<CurrentGroupImageRow> {
-    const selected = await this.oracle.execute<CurrentGroupImageRow>(
-      connection,
-      `SELECT G.IMAGE_KEY AS CURRENT_STORAGE_KEY, G.CONTEXT_ID
-         FROM SPLITO_GROUPS G
-        WHERE G.GROUP_ID = :groupId
-        FOR UPDATE OF G.IMAGE_KEY`,
-      { groupId: uuidToRaw(groupId) },
-    );
-    const current = selected.rows?.[0];
-    if (!current) {
+  private async requireGroup(work: MongoUnitOfWork, groupId: string): Promise<GroupDocument> {
+    const group = await work.db
+      .collection<GroupDocument>(COLLECTIONS.groups)
+      .findOne({ _id: groupId.toLowerCase() }, mongoOptions(work));
+    if (!group) {
       throw new ApiError(404, 'GROUP_NOT_FOUND', 'The group does not exist or is not accessible.');
     }
-    return current;
+    return group;
   }
 
   private async insertMedia(
-    connection: Connection,
+    work: MongoUnitOfWork,
     kind: MediaKind,
     values: NewMediaValues,
     owner: { readonly userId: string } | { readonly groupId: string },
   ): Promise<void> {
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_MEDIA_OBJECTS (
-         MEDIA_ID, MEDIA_KIND, OWNER_USER_ID, OWNER_GROUP_ID,
-         UPLOADED_BY_PARTICIPANT_ID, STORAGE_PROVIDER, STORAGE_KEY,
-         MEDIA_TYPE, BYTE_SIZE, SHA256_HASH, WIDTH_PX, HEIGHT_PX
-       ) VALUES (
-         :mediaId, :kind, :ownerUserId, :ownerGroupId,
-         :actorParticipantId, 'FILESYSTEM', :storageKey,
-         :mediaType, :byteSize, :sha256Hash, :width, :height
-       )`,
+    const now = new Date();
+    await work.db.collection<MediaDocument>(COLLECTIONS.mediaObjects).insertOne(
       {
-        mediaId: uuidToRaw(values.mediaId),
-        kind,
-        ownerUserId: 'userId' in owner ? uuidToRaw(owner.userId) : null,
-        ownerGroupId: 'groupId' in owner ? uuidToRaw(owner.groupId) : null,
-        actorParticipantId: uuidToRaw(values.actorParticipantId),
+        _id: values.mediaId.toLowerCase(),
+        mediaKind: kind,
+        ...('userId' in owner
+          ? { ownerUserId: owner.userId.toLowerCase() }
+          : { ownerGroupId: owner.groupId.toLowerCase() }),
+        uploadedByParticipantId: values.actorParticipantId.toLowerCase(),
+        storageProvider: 'FILESYSTEM',
         storageKey: values.storageKey,
         mediaType: values.processed.mediaType,
         byteSize: values.processed.byteSize,
-        sha256Hash: values.processed.sha256Hash,
-        width: values.processed.width,
-        height: values.processed.height,
+        sha256Hash: Buffer.from(values.processed.sha256Hash),
+        widthPixels: values.processed.width,
+        heightPixels: values.processed.height,
+        status: 'ACTIVE',
+        createdAt: now,
+        updatedAt: now,
       },
+      mongoOptions(work),
     );
   }
 
-  private async supersede(connection: Connection, storageKey: string | null): Promise<void> {
+  private async supersede(work: MongoUnitOfWork, storageKey?: string): Promise<void> {
     if (!storageKey) return;
-    const result = await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_MEDIA_OBJECTS
-          SET STATUS = 'SUPERSEDED',
-              SUPERSEDED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE STORAGE_KEY = :storageKey
-          AND STATUS = 'ACTIVE'`,
-      { storageKey },
-    );
-    if (result.rowsAffected !== 1) {
+    const now = new Date();
+    const result = await work.db
+      .collection<MediaDocument>(COLLECTIONS.mediaObjects)
+      .updateOne(
+        { storageKey, status: 'ACTIVE' },
+        { $set: { status: 'SUPERSEDED', supersededAt: now, updatedAt: now } },
+        mongoOptions(work),
+      );
+    if (result.modifiedCount !== 1) {
       throw new Error('Current image metadata was not superseded exactly once');
     }
   }
 
-  private async markDeleted(connection: Connection, storageKey: string): Promise<void> {
-    const result = await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_MEDIA_OBJECTS
-          SET STATUS = 'DELETED',
-              DELETED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE STORAGE_KEY = :storageKey
-          AND STATUS = 'ACTIVE'`,
-      { storageKey },
-    );
-    if (result.rowsAffected !== 1) {
+  private async markDeleted(work: MongoUnitOfWork, storageKey: string): Promise<void> {
+    const now = new Date();
+    const result = await work.db
+      .collection<MediaDocument>(COLLECTIONS.mediaObjects)
+      .updateOne(
+        { storageKey, status: 'ACTIVE' },
+        { $set: { status: 'DELETED', deletedAt: now, updatedAt: now } },
+        mongoOptions(work),
+      );
+    if (result.modifiedCount !== 1) {
       throw new Error('Current image metadata was not deleted exactly once');
     }
   }
 
-  private async bumpContextVersion(connection: Connection, contextId: string): Promise<void> {
-    await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_CONTEXTS
-          SET VERSION_NO = VERSION_NO + 1,
-              UPDATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE CONTEXT_ID = :contextId`,
-      { contextId: uuidToRaw(contextId) },
-    );
+  private async bumpContextVersion(work: MongoUnitOfWork, contextId: string): Promise<void> {
+    const result = await work.db
+      .collection<ContextDocument>(COLLECTIONS.contexts)
+      .updateOne(
+        { _id: contextId.toLowerCase() },
+        { $inc: { mutationVersion: 1 }, $set: { updatedAt: new Date() } },
+        mongoOptions(work),
+      );
+    if (result.matchedCount !== 1) throw new Error('Group context version was not updated');
   }
 
   private async audit(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: {
       readonly actorParticipantId: string;
       readonly actorUserId: string;
@@ -378,26 +402,22 @@ export class MediaRepository {
           height: values.processed.height,
         }
       : {};
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_AUDIT_EVENTS (
-         AUDIT_EVENT_ID, ACTOR_PARTICIPANT_ID, ACTOR_USER_ID, ACTION_KEY,
-         RESOURCE_TYPE, RESOURCE_ID, CONTEXT_ID, REQUEST_ID, METADATA_JSON
-       ) VALUES (
-         :auditId, :actorParticipantId, :actorUserId, :action,
-         :resourceType, :resourceId, :contextId, :requestId, :metadata
-       )`,
-      {
-        auditId: uuidToRaw(values.auditId),
-        actorParticipantId: uuidToRaw(values.actorParticipantId),
-        actorUserId: uuidToRaw(values.actorUserId),
-        action: resource.action,
-        resourceType: resource.resourceType,
-        resourceId: uuidToRaw(resource.resourceId),
-        contextId: resource.contextId ? uuidToRaw(resource.contextId) : null,
-        requestId: values.requestId,
-        metadata: JSON.stringify(metadata),
-      },
-    );
+    await work.db
+      .collection<{ _id: string } & Record<string, unknown>>(COLLECTIONS.auditEvents)
+      .insertOne(
+        {
+          _id: values.auditId.toLowerCase(),
+          actorParticipantId: values.actorParticipantId.toLowerCase(),
+          actorUserId: values.actorUserId.toLowerCase(),
+          actionKey: resource.action,
+          resourceType: resource.resourceType,
+          resourceId: resource.resourceId.toLowerCase(),
+          ...(resource.contextId ? { contextId: resource.contextId.toLowerCase() } : {}),
+          requestId: values.requestId,
+          metadata,
+          createdAt: new Date(),
+        },
+        mongoOptions(work),
+      );
   }
 }

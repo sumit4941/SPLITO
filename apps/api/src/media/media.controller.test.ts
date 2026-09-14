@@ -2,7 +2,7 @@ import { loadEnvironment } from '@splito/config';
 import { describe, expect, it, vi } from 'vitest';
 import type { ContextAccessRepository } from '../access/context-access.repository.js';
 import type { AuthContext } from '../auth/auth.types.js';
-import type { OracleService } from '../database/oracle.service.js';
+import type { MongoService } from '../database/mongo.service.js';
 import type { ImageProcessor } from './image.processor.js';
 import { MediaController } from './media.controller.js';
 import type { MediaRepository } from './media.repository.js';
@@ -47,7 +47,7 @@ describe('authenticated media controller boundary', () => {
       NODE_ENV: 'production',
     });
     const service = new MediaService(
-      {} as OracleService,
+      {} as MongoService,
       {} as ContextAccessRepository,
       {} as MediaRepository,
       storage,

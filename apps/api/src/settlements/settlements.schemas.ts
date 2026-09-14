@@ -1,6 +1,9 @@
 import { z } from 'zod';
 
-const uuid = z.string().regex(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu);
+const uuid = z
+  .string()
+  .regex(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu)
+  .transform((value) => value.toLowerCase());
 const positiveMinor = z.string().regex(/^[1-9][0-9]{0,18}$/);
 const validDate = (value: string): boolean => {
   const date = new Date(`${value}T00:00:00.000Z`);

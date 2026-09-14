@@ -1,7 +1,10 @@
 import { Injectable } from '@nestjs/common';
-import type { Connection } from 'oracledb';
-import { OracleService } from '../database/oracle.service.js';
-import { rawToUuid, uuidToRaw } from '../database/uuid.js';
+import {
+  COLLECTIONS,
+  MongoService,
+  mongoOptions,
+  type MongoUnitOfWork,
+} from '../database/mongo.service.js';
 import { groupImageUrl, participantAvatarUrl } from '../media/media.types.js';
 import type { CreateGroupInput } from './groups.schemas.js';
 
@@ -39,24 +42,80 @@ export interface PendingGroupInvitation {
   readonly status: 'pending';
 }
 
-interface GroupRow {
-  GROUP_ID: Buffer;
-  CONTEXT_ID: Buffer;
-  GROUP_NAME: string;
-  DESCRIPTION: string | null;
-  IMAGE_MEDIA_ID: Buffer | null;
-  GROUP_TYPE: string;
-  DEFAULT_CURRENCY_CODE: string;
-  SIMPLIFICATION_FLAG: 'Y' | 'N';
-  STATUS: 'ACTIVE' | 'ARCHIVED';
-  MEMBER_ROLE: 'OWNER' | 'ADMIN' | 'MEMBER';
-  VERSION_NO: string;
-  CREATED_AT: string;
-  UPDATED_AT: string;
-  MEMBER_COUNT: string;
+interface ContextDocument {
+  _id: string;
+  type: 'GROUP' | 'DIRECT' | 'PERSONAL';
+  defaultCurrencyCode: string;
+  simplificationEnabled: boolean;
+  status: 'ACTIVE' | 'ARCHIVED';
+  mutationVersion: number;
+  createdByParticipantId: string;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
-function roleToJson(role: 'OWNER' | 'ADMIN' | 'MEMBER'): 'owner' | 'administrator' | 'member' {
+interface GroupDocument {
+  _id: string;
+  contextId: string;
+  name: string;
+  description?: string;
+  type: string;
+  status: 'ACTIVE' | 'ARCHIVED';
+  imageKey?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface ContextMemberDocument {
+  _id: string;
+  contextId: string;
+  participantId: string;
+  role: 'OWNER' | 'ADMIN' | 'MEMBER';
+  status: 'ACTIVE' | 'FORMER';
+  allocationOrder: number;
+  addedByParticipantId: string;
+  joinedAt: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface ParticipantDocument {
+  _id: string;
+  userId?: string;
+  kind: 'USER' | 'GUEST';
+  displayName: string;
+}
+
+interface UserDocument {
+  _id: string;
+  avatarKey?: string;
+}
+
+interface MediaDocument {
+  _id: string;
+  ownerUserId?: string;
+  ownerGroupId?: string;
+  storageKey: string;
+  mediaKind: 'USER_AVATAR' | 'GROUP_IMAGE';
+  status: 'ACTIVE' | 'SUPERSEDED' | 'DELETED';
+}
+
+interface InvitationDocument {
+  _id: string;
+  invitationType: 'GROUP';
+  contextId: string;
+  inviteeMobileE164?: string;
+  status: 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'REVOKED' | 'EXPIRED';
+  expiresAt: Date;
+  createdAt: Date;
+}
+
+interface EventDocument {
+  _id: string;
+  [key: string]: unknown;
+}
+
+function roleToJson(role: ContextMemberDocument['role']): GroupSummary['role'] {
   return role === 'OWNER' ? 'owner' : role === 'ADMIN' ? 'administrator' : 'member';
 }
 
@@ -65,64 +124,91 @@ function maskMobileNumber(mobileNumber: string): string {
   return `+${'*'.repeat(Math.max(4, mobileNumber.length - 5))}${visibleDigits}`;
 }
 
-function mapGroup(row: GroupRow): GroupSummary {
-  const groupId = rawToUuid(row.GROUP_ID);
+function mapGroup(
+  group: GroupDocument,
+  context: ContextDocument,
+  membership: ContextMemberDocument,
+  memberCount: number,
+  imageId?: string,
+): GroupSummary {
   return {
-    id: groupId,
-    contextId: rawToUuid(row.CONTEXT_ID),
-    name: row.GROUP_NAME,
-    ...(row.DESCRIPTION ? { description: row.DESCRIPTION } : {}),
-    ...(row.IMAGE_MEDIA_ID
-      ? { imageUrl: groupImageUrl(groupId, rawToUuid(row.IMAGE_MEDIA_ID)) }
-      : {}),
-    type: row.GROUP_TYPE.toLowerCase(),
-    defaultCurrency: row.DEFAULT_CURRENCY_CODE.trim(),
-    simplificationEnabled: row.SIMPLIFICATION_FLAG === 'Y',
-    archived: row.STATUS === 'ARCHIVED',
-    role: roleToJson(row.MEMBER_ROLE),
-    memberCount: Number(row.MEMBER_COUNT),
-    version: row.VERSION_NO,
-    createdAt: row.CREATED_AT,
-    updatedAt: row.UPDATED_AT,
+    id: group._id,
+    contextId: context._id,
+    name: group.name,
+    ...(group.description ? { description: group.description } : {}),
+    ...(imageId ? { imageUrl: groupImageUrl(group._id, imageId) } : {}),
+    type: group.type.toLowerCase(),
+    defaultCurrency: context.defaultCurrencyCode,
+    simplificationEnabled: context.simplificationEnabled,
+    archived: context.status === 'ARCHIVED',
+    role: roleToJson(membership.role),
+    memberCount,
+    version: String(context.mutationVersion),
+    createdAt: context.createdAt.toISOString(),
+    updatedAt: context.updatedAt.toISOString(),
   };
 }
 
 @Injectable()
 export class GroupsRepository {
-  constructor(private readonly oracle: OracleService) {}
+  constructor(private readonly mongo: MongoService) {}
 
   async list(participantId: string): Promise<GroupSummary[]> {
-    return this.oracle.withConnection(async (connection) => {
-      const result = await this.oracle.execute<GroupRow>(
-        connection,
-        `SELECT G.GROUP_ID, G.CONTEXT_ID, G.GROUP_NAME, G.DESCRIPTION, G.GROUP_TYPE,
-                GROUP_IMAGE.MEDIA_ID AS IMAGE_MEDIA_ID,
-                C.DEFAULT_CURRENCY_CODE, C.SIMPLIFICATION_FLAG, C.STATUS,
-                M.MEMBER_ROLE, TO_CHAR(C.VERSION_NO) AS VERSION_NO,
-                TO_CHAR(C.CREATED_AT_UTC, 'YYYY-MM-DD"T"HH24:MI:SS.FF6"Z"') AS CREATED_AT,
-                TO_CHAR(C.UPDATED_AT_UTC, 'YYYY-MM-DD"T"HH24:MI:SS.FF6"Z"') AS UPDATED_AT,
-                (SELECT COUNT(*) FROM SPLITO_CONTEXT_MEMBERS MC
-                  WHERE MC.CONTEXT_ID = C.CONTEXT_ID AND MC.STATUS = 'ACTIVE') AS MEMBER_COUNT
-           FROM SPLITO_GROUPS G
-           JOIN SPLITO_CONTEXTS C ON C.CONTEXT_ID = G.CONTEXT_ID
-           LEFT JOIN SPLITO_MEDIA_OBJECTS GROUP_IMAGE
-             ON GROUP_IMAGE.OWNER_GROUP_ID = G.GROUP_ID
-            AND GROUP_IMAGE.STORAGE_KEY = G.IMAGE_KEY
-            AND GROUP_IMAGE.MEDIA_KIND = 'GROUP_IMAGE'
-            AND GROUP_IMAGE.STATUS = 'ACTIVE'
-           JOIN SPLITO_CONTEXT_MEMBERS M
-             ON M.CONTEXT_ID = C.CONTEXT_ID
-            AND M.PARTICIPANT_ID = :participantId
-            AND M.STATUS = 'ACTIVE'
-          ORDER BY C.UPDATED_AT_UTC DESC, G.GROUP_ID`,
-        { participantId: uuidToRaw(participantId) },
+    return this.mongo.withTransaction(async (work) => {
+      const options = mongoOptions(work);
+      const memberships = await work.db
+        .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+        .find({ participantId: participantId.toLowerCase(), status: 'ACTIVE' }, options)
+        .toArray();
+      if (memberships.length === 0) return [];
+      const contextIds = memberships.map((membership) => membership.contextId);
+      const contexts = await work.db
+        .collection<ContextDocument>(COLLECTIONS.contexts)
+        .find({ _id: { $in: contextIds }, type: 'GROUP' }, options)
+        .toArray();
+      const groups = await work.db
+        .collection<GroupDocument>(COLLECTIONS.groups)
+        .find({ contextId: { $in: contextIds } }, options)
+        .toArray();
+      const counts = await work.db
+        .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+        .aggregate<{ _id: string; count: number }>(
+          [
+            { $match: { contextId: { $in: contextIds }, status: 'ACTIVE' } },
+            { $group: { _id: '$contextId', count: { $sum: 1 } } },
+          ],
+          options,
+        )
+        .toArray();
+      const contextById = new Map(contexts.map((context) => [context._id, context]));
+      const membershipByContext = new Map(
+        memberships.map((membership) => [membership.contextId, membership]),
       );
-      return (result.rows ?? []).map(mapGroup);
+      const countByContext = new Map(counts.map((entry) => [entry._id, entry.count]));
+      const activeImages = await this.activeGroupImages(work, groups);
+      return groups
+        .map((group) => {
+          const context = contextById.get(group.contextId);
+          const membership = membershipByContext.get(group.contextId);
+          if (!context || !membership) return undefined;
+          return mapGroup(
+            group,
+            context,
+            membership,
+            countByContext.get(group.contextId) ?? 0,
+            activeImages.get(group._id),
+          );
+        })
+        .filter((group): group is GroupSummary => Boolean(group))
+        .sort((left, right) => {
+          const updated = right.updatedAt.localeCompare(left.updatedAt);
+          return updated === 0 ? left.id.localeCompare(right.id) : updated;
+        });
     });
   }
 
   async create(
-    connection: Connection,
+    work: MongoUnitOfWork,
     values: CreateGroupInput & {
       readonly groupId: string;
       readonly contextId: string;
@@ -134,99 +220,83 @@ export class GroupsRepository {
       readonly auditId: string;
     },
   ): Promise<GroupSummary> {
-    const contextId = uuidToRaw(values.contextId);
-    const actorParticipantId = uuidToRaw(values.actorParticipantId);
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_CONTEXTS (
-         CONTEXT_ID, CONTEXT_TYPE, DEFAULT_CURRENCY_CODE, SIMPLIFICATION_FLAG,
-         CREATED_BY_PARTICIPANT_ID
-       ) VALUES (
-         :contextId, 'GROUP', :currencyCode, :simplificationFlag, :actorParticipantId
-       )`,
-      {
-        contextId,
-        currencyCode: values.defaultCurrency,
-        simplificationFlag: values.simplificationEnabled ? 'Y' : 'N',
-        actorParticipantId,
-      },
-    );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_GROUPS (
-         GROUP_ID, CONTEXT_ID, GROUP_NAME, DESCRIPTION, GROUP_TYPE
-       ) VALUES (:groupId, :contextId, :groupName, :description, :groupType)`,
-      {
-        groupId: uuidToRaw(values.groupId),
-        contextId,
-        groupName: values.name,
-        description: values.description ?? null,
-        groupType: values.type.toUpperCase(),
-      },
-    );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_CONTEXT_MEMBERS (
-         MEMBERSHIP_ID, CONTEXT_ID, PARTICIPANT_ID, MEMBER_ROLE, ALLOCATION_ORDER,
-         ADDED_BY_PARTICIPANT_ID
-       ) VALUES (
-         :membershipId, :contextId, :actorParticipantId, 'OWNER', 0,
-         :actorParticipantId
-       )`,
-      {
-        membershipId: uuidToRaw(values.membershipId),
-        contextId,
-        actorParticipantId,
-      },
-    );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_OUTBOX (
-         OUTBOX_ID, EVENT_TYPE, AGGREGATE_TYPE, AGGREGATE_ID, PAYLOAD_JSON
-       ) VALUES (:outboxId, 'group.created', 'GROUP', :groupId, :payload)`,
-      {
-        outboxId: uuidToRaw(values.outboxId),
-        groupId: uuidToRaw(values.groupId),
-        payload: JSON.stringify({ groupId: values.groupId, contextId: values.contextId }),
-      },
-    );
-    await this.oracle.execute(
-      connection,
-      `INSERT INTO SPLITO_AUDIT_EVENTS (
-         AUDIT_EVENT_ID, ACTOR_PARTICIPANT_ID, ACTOR_USER_ID, ACTION_KEY,
-         RESOURCE_TYPE, RESOURCE_ID, CONTEXT_ID, REQUEST_ID, METADATA_JSON
-       ) VALUES (
-         :auditId, :actorParticipantId, :actorUserId, 'group.create',
-         'GROUP', :groupId, :contextId, :requestId, '{}'
-       )`,
-      {
-        auditId: uuidToRaw(values.auditId),
-        actorParticipantId,
-        actorUserId: uuidToRaw(values.actorUserId),
-        groupId: uuidToRaw(values.groupId),
-        contextId,
-        requestId: values.requestId,
-      },
-    );
-    return {
-      id: values.groupId,
-      contextId: values.contextId,
+    const now = new Date();
+    const contextId = values.contextId.toLowerCase();
+    const groupId = values.groupId.toLowerCase();
+    const actorParticipantId = values.actorParticipantId.toLowerCase();
+    const options = mongoOptions(work);
+    const context: ContextDocument = {
+      _id: contextId,
+      type: 'GROUP',
+      defaultCurrencyCode: values.defaultCurrency,
+      simplificationEnabled: values.simplificationEnabled,
+      status: 'ACTIVE',
+      mutationVersion: 1,
+      createdByParticipantId: actorParticipantId,
+      createdAt: now,
+      updatedAt: now,
+    };
+    const group: GroupDocument = {
+      _id: groupId,
+      contextId,
       name: values.name,
       ...(values.description ? { description: values.description } : {}),
-      type: values.type,
-      defaultCurrency: values.defaultCurrency,
-      simplificationEnabled: values.simplificationEnabled,
-      archived: false,
-      role: 'owner',
-      memberCount: 1,
-      version: '1',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      type: values.type.toUpperCase(),
+      status: 'ACTIVE',
+      createdAt: now,
+      updatedAt: now,
     };
+    const membership: ContextMemberDocument = {
+      _id: values.membershipId.toLowerCase(),
+      contextId,
+      participantId: actorParticipantId,
+      role: 'OWNER',
+      status: 'ACTIVE',
+      allocationOrder: 0,
+      addedByParticipantId: actorParticipantId,
+      joinedAt: now,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await work.db.collection<ContextDocument>(COLLECTIONS.contexts).insertOne(context, options);
+    await work.db.collection<GroupDocument>(COLLECTIONS.groups).insertOne(group, options);
+    await work.db
+      .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+      .insertOne(membership, options);
+    await work.db.collection<EventDocument>(COLLECTIONS.outbox).insertOne(
+      {
+        _id: values.outboxId.toLowerCase(),
+        eventType: 'group.created',
+        aggregateType: 'GROUP',
+        aggregateId: groupId,
+        payload: { groupId, contextId },
+        status: 'PENDING',
+        availableAt: now,
+        attempts: 0,
+        createdAt: now,
+      },
+      options,
+    );
+    await work.db.collection<EventDocument>(COLLECTIONS.auditEvents).insertOne(
+      {
+        _id: values.auditId.toLowerCase(),
+        actorParticipantId,
+        actorUserId: values.actorUserId.toLowerCase(),
+        actionKey: 'group.create',
+        resourceType: 'GROUP',
+        resourceId: groupId,
+        contextId,
+        requestId: values.requestId,
+        metadata: {},
+        createdAt: now,
+      },
+      options,
+    );
+    return mapGroup(group, context, membership, 1);
   }
 
   async detail(
-    connection: Connection,
+    work: MongoUnitOfWork,
     groupId: string,
     participantId: string,
   ): Promise<
@@ -237,102 +307,162 @@ export class GroupsRepository {
       }
     | undefined
   > {
-    const groups = await this.oracle.execute<GroupRow>(
-      connection,
-      `SELECT G.GROUP_ID, G.CONTEXT_ID, G.GROUP_NAME, G.DESCRIPTION, G.GROUP_TYPE,
-              GROUP_IMAGE.MEDIA_ID AS IMAGE_MEDIA_ID,
-              C.DEFAULT_CURRENCY_CODE, C.SIMPLIFICATION_FLAG, C.STATUS,
-              CALLER_M.MEMBER_ROLE, TO_CHAR(C.VERSION_NO) AS VERSION_NO,
-              TO_CHAR(C.CREATED_AT_UTC, 'YYYY-MM-DD"T"HH24:MI:SS.FF6"Z"') AS CREATED_AT,
-              TO_CHAR(C.UPDATED_AT_UTC, 'YYYY-MM-DD"T"HH24:MI:SS.FF6"Z"') AS UPDATED_AT,
-              (SELECT COUNT(*) FROM SPLITO_CONTEXT_MEMBERS MC
-                WHERE MC.CONTEXT_ID = C.CONTEXT_ID AND MC.STATUS = 'ACTIVE') AS MEMBER_COUNT
-         FROM SPLITO_GROUPS G
-         JOIN SPLITO_CONTEXTS C ON C.CONTEXT_ID = G.CONTEXT_ID
-         LEFT JOIN SPLITO_MEDIA_OBJECTS GROUP_IMAGE
-           ON GROUP_IMAGE.OWNER_GROUP_ID = G.GROUP_ID
-          AND GROUP_IMAGE.STORAGE_KEY = G.IMAGE_KEY
-          AND GROUP_IMAGE.MEDIA_KIND = 'GROUP_IMAGE'
-          AND GROUP_IMAGE.STATUS = 'ACTIVE'
-         JOIN SPLITO_CONTEXT_MEMBERS CALLER_M
-           ON CALLER_M.CONTEXT_ID = C.CONTEXT_ID
-          AND CALLER_M.PARTICIPANT_ID = :participantId
-          AND CALLER_M.STATUS = 'ACTIVE'
-        WHERE G.GROUP_ID = :groupId`,
-      { groupId: uuidToRaw(groupId), participantId: uuidToRaw(participantId) },
-    );
-    const groupRow = groups.rows?.[0];
-    if (!groupRow) return undefined;
+    const options = mongoOptions(work);
+    const group = await work.db
+      .collection<GroupDocument>(COLLECTIONS.groups)
+      .findOne({ _id: groupId.toLowerCase() }, options);
+    if (!group) return undefined;
+    const context = await work.db
+      .collection<ContextDocument>(COLLECTIONS.contexts)
+      .findOne({ _id: group.contextId }, options);
+    const callerMembership = await work.db
+      .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+      .findOne(
+        {
+          contextId: group.contextId,
+          participantId: participantId.toLowerCase(),
+          status: 'ACTIVE',
+        },
+        options,
+      );
+    const memberships = await work.db
+      .collection<ContextMemberDocument>(COLLECTIONS.contextMembers)
+      .find({ contextId: group.contextId }, options)
+      .sort({ allocationOrder: 1, _id: 1 })
+      .toArray();
+    if (!context || !callerMembership) return undefined;
 
-    const memberRows = await this.oracle.execute<{
-      PARTICIPANT_ID: Buffer;
-      DISPLAY_NAME: string;
-      KIND: 'USER' | 'GUEST';
-      MEMBER_ROLE: 'OWNER' | 'ADMIN' | 'MEMBER';
-      STATUS: 'ACTIVE' | 'LEFT' | 'REMOVED';
-      ALLOCATION_ORDER: string;
-      AVATAR_MEDIA_ID: Buffer | null;
-    }>(
-      connection,
-      `SELECT P.PARTICIPANT_ID, P.DISPLAY_NAME, P.KIND, M.MEMBER_ROLE, M.STATUS,
-              TO_CHAR(M.ALLOCATION_ORDER) AS ALLOCATION_ORDER,
-              AVATAR.MEDIA_ID AS AVATAR_MEDIA_ID
-         FROM SPLITO_CONTEXT_MEMBERS M
-         JOIN SPLITO_PARTICIPANTS P ON P.PARTICIPANT_ID = M.PARTICIPANT_ID
-         LEFT JOIN SPLITO_USERS U ON U.USER_ID = P.USER_ID
-         LEFT JOIN SPLITO_MEDIA_OBJECTS AVATAR
-           ON AVATAR.OWNER_USER_ID = U.USER_ID
-          AND AVATAR.STORAGE_KEY = U.AVATAR_KEY
-          AND AVATAR.MEDIA_KIND = 'USER_AVATAR'
-          AND AVATAR.STATUS = 'ACTIVE'
-        WHERE M.CONTEXT_ID = :contextId
-        ORDER BY M.ALLOCATION_ORDER, M.MEMBERSHIP_ID`,
-      { contextId: groupRow.CONTEXT_ID },
+    const participantIds = memberships.map((membership) => membership.participantId);
+    const participants =
+      participantIds.length === 0
+        ? []
+        : await work.db
+            .collection<ParticipantDocument>(COLLECTIONS.participants)
+            .find({ _id: { $in: participantIds } }, options)
+            .toArray();
+    const participantById = new Map(
+      participants.map((participant) => [participant._id, participant]),
     );
+    const userIds = participants.flatMap((participant) =>
+      participant.userId ? [participant.userId] : [],
+    );
+    const users =
+      userIds.length === 0
+        ? []
+        : await work.db
+            .collection<UserDocument>(COLLECTIONS.users)
+            .find({ _id: { $in: userIds } }, options)
+            .toArray();
+    const userById = new Map(users.map((user) => [user._id, user]));
+    const avatarKeys = users.flatMap((user) => (user.avatarKey ? [user.avatarKey] : []));
+    const avatars =
+      avatarKeys.length === 0
+        ? []
+        : await work.db
+            .collection<MediaDocument>(COLLECTIONS.mediaObjects)
+            .find(
+              {
+                storageKey: { $in: avatarKeys },
+                mediaKind: 'USER_AVATAR',
+                status: 'ACTIVE',
+              },
+              options,
+            )
+            .toArray();
+    const avatarByStorageKey = new Map(avatars.map((avatar) => [avatar.storageKey, avatar._id]));
+    const groupImage = await this.activeGroupImage(work, group);
 
-    const pendingInvitationRows =
-      groupRow.MEMBER_ROLE === 'OWNER' || groupRow.MEMBER_ROLE === 'ADMIN'
-        ? await this.oracle.execute<{
-            INVITATION_ID: Buffer;
-            INVITEE_MOBILE_E164: string;
-            EXPIRES_AT: string;
-          }>(
-            connection,
-            `SELECT INVITATION_ID, INVITEE_MOBILE_E164,
-                    TO_CHAR(EXPIRES_AT_UTC, 'YYYY-MM-DD"T"HH24:MI:SS.FF6"Z"') AS EXPIRES_AT
-               FROM SPLITO_INVITATIONS
-              WHERE CONTEXT_ID = :contextId
-                AND INVITATION_TYPE = 'GROUP'
-                AND STATUS = 'PENDING'
-                AND INVITEE_MOBILE_E164 IS NOT NULL
-                AND EXPIRES_AT_UTC > SYS_EXTRACT_UTC(SYSTIMESTAMP)
-              ORDER BY CREATED_AT_UTC DESC, INVITATION_ID`,
-            { contextId: groupRow.CONTEXT_ID },
+    const members = memberships.flatMap((membership): GroupMember[] => {
+      const participant = participantById.get(membership.participantId);
+      if (!participant) return [];
+      const user = participant.userId ? userById.get(participant.userId) : undefined;
+      const avatarId = user?.avatarKey ? avatarByStorageKey.get(user.avatarKey) : undefined;
+      return [
+        {
+          id: participant._id,
+          displayName: participant.displayName,
+          ...(avatarId ? { avatarUrl: participantAvatarUrl(participant._id, avatarId) } : {}),
+          kind: participant.kind,
+          role: participant.kind === 'GUEST' ? 'guest' : roleToJson(membership.role),
+          status: membership.status === 'ACTIVE' ? 'active' : 'former',
+          allocationOrder: membership.allocationOrder,
+        },
+      ];
+    });
+
+    const manager = callerMembership.role === 'OWNER' || callerMembership.role === 'ADMIN';
+    const pendingInvitations = manager
+      ? await work.db
+          .collection<InvitationDocument>(COLLECTIONS.invitations)
+          .find(
+            {
+              contextId: group.contextId,
+              invitationType: 'GROUP',
+              status: 'PENDING',
+              inviteeMobileE164: { $type: 'string' },
+              expiresAt: { $gt: new Date() },
+            },
+            options,
           )
-        : undefined;
+          .sort({ createdAt: -1, _id: 1 })
+          .toArray()
+      : [];
 
     return {
-      group: mapGroup(groupRow),
-      members: (memberRows.rows ?? []).map((row) => {
-        const id = rawToUuid(row.PARTICIPANT_ID);
-        return {
-          id,
-          displayName: row.DISPLAY_NAME,
-          ...(row.AVATAR_MEDIA_ID
-            ? { avatarUrl: participantAvatarUrl(id, rawToUuid(row.AVATAR_MEDIA_ID)) }
-            : {}),
-          kind: row.KIND,
-          role: row.KIND === 'GUEST' ? 'guest' : roleToJson(row.MEMBER_ROLE),
-          status: row.STATUS === 'ACTIVE' ? 'active' : 'former',
-          allocationOrder: Number(row.ALLOCATION_ORDER),
-        };
-      }),
-      pendingInvitations: (pendingInvitationRows?.rows ?? []).map((row) => ({
-        id: rawToUuid(row.INVITATION_ID),
-        maskedMobileNumber: maskMobileNumber(row.INVITEE_MOBILE_E164),
-        expiresAt: row.EXPIRES_AT,
-        status: 'pending',
-      })),
+      group: mapGroup(
+        group,
+        context,
+        callerMembership,
+        members.filter((m) => m.status === 'active').length,
+        groupImage?._id,
+      ),
+      members,
+      pendingInvitations: pendingInvitations.flatMap((invitation) =>
+        invitation.inviteeMobileE164
+          ? [
+              {
+                id: invitation._id,
+                maskedMobileNumber: maskMobileNumber(invitation.inviteeMobileE164),
+                expiresAt: invitation.expiresAt.toISOString(),
+                status: 'pending' as const,
+              },
+            ]
+          : [],
+      ),
     };
+  }
+
+  private async activeGroupImages(
+    work: MongoUnitOfWork,
+    groups: readonly GroupDocument[],
+  ): Promise<Map<string, string>> {
+    const groupIds = groups.map((group) => group._id);
+    if (groupIds.length === 0) return new Map();
+    const images = await work.db
+      .collection<MediaDocument>(COLLECTIONS.mediaObjects)
+      .find(
+        { ownerGroupId: { $in: groupIds }, mediaKind: 'GROUP_IMAGE', status: 'ACTIVE' },
+        mongoOptions(work),
+      )
+      .toArray();
+    return new Map(images.map((image) => [image.ownerGroupId as string, image._id]));
+  }
+
+  private async activeGroupImage(
+    work: MongoUnitOfWork,
+    group: GroupDocument,
+  ): Promise<MediaDocument | undefined> {
+    if (!group.imageKey) return undefined;
+    return (
+      (await work.db.collection<MediaDocument>(COLLECTIONS.mediaObjects).findOne(
+        {
+          ownerGroupId: group._id,
+          storageKey: group.imageKey,
+          mediaKind: 'GROUP_IMAGE',
+          status: 'ACTIVE',
+        },
+        mongoOptions(work),
+      )) ?? undefined
+    );
   }
 }

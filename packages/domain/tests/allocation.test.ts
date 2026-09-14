@@ -36,7 +36,7 @@ describe('money boundaries', () => {
     },
   );
 
-  it('enforces the Oracle NUMBER(19,0) domain limit', () => {
+  it('enforces the persisted 19-digit minor-unit domain limit', () => {
     expect(parseMinorAmount(MAX_MINOR_AMOUNT.toString())).toBe(MAX_MINOR_AMOUNT);
     expect(() => parseMinorAmount((MAX_MINOR_AMOUNT + 1n).toString())).toThrowError(
       expect.objectContaining({ code: 'MINOR_AMOUNT_OUT_OF_RANGE' }),

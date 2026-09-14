@@ -8,6 +8,10 @@ const booleanFromEnv = z
 const optionalEnvironmentString = (schema: z.ZodString) =>
   z.union([schema, z.literal('').transform(() => undefined)]).optional();
 
+function isLocalMongoUri(value: string): boolean {
+  return /^mongodb:\/\/(?:[^/?#@]*@)?(?:localhost|127\.0\.0\.1|\[::1\])(?::|\/|\?|$)/iu.test(value);
+}
+
 const baseEnvironmentSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
@@ -15,21 +19,27 @@ const baseEnvironmentSchema = z.object({
   API_PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   WEB_ORIGIN: z.string().url().default('http://localhost:5173'),
   TRUST_PROXY: booleanFromEnv,
-  DATABASE_CONNECT_STRING: z.string().min(1).default('localhost:1521/FREEPDB1'),
-  DATABASE_USER: z
+  MONGODB_URI: z
     .string()
-    .regex(/^[A-Z][A-Z0-9_$#]{0,29}$/)
-    .default('SPLITO_APP'),
-  DATABASE_OWNER_SCHEMA: z
+    .min(1)
+    .refine((value) => /^mongodb(?:\+srv)?:\/\//u.test(value), {
+      message: 'MONGODB_URI must use mongodb:// or mongodb+srv://',
+    })
+    .default('mongodb://127.0.0.1:27017/?replicaSet=rs0'),
+  MONGODB_DATABASE: z
     .string()
-    .regex(/^[A-Z][A-Z0-9_$#]{0,29}$/)
-    .default('SPLITO_OWNER'),
-  DATABASE_PASSWORD: z.string().min(12).optional(),
-  DATABASE_POOL_MIN: z.coerce.number().int().min(0).max(20).default(1),
-  DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(50).default(8),
-  DATABASE_POOL_INCREMENT: z.coerce.number().int().min(0).max(10).default(1),
-  DATABASE_QUEUE_TIMEOUT_MS: z.coerce.number().int().min(100).max(120_000).default(5_000),
-  DATABASE_CALL_TIMEOUT_MS: z.coerce.number().int().min(100).max(120_000).default(15_000),
+    .regex(/^[A-Za-z0-9_-]{1,63}$/u)
+    .default('splito'),
+  MONGODB_MIN_POOL_SIZE: z.coerce.number().int().min(0).max(20).default(1),
+  MONGODB_MAX_POOL_SIZE: z.coerce.number().int().min(1).max(100).default(10),
+  MONGODB_CONNECT_TIMEOUT_MS: z.coerce.number().int().min(100).max(120_000).default(10_000),
+  MONGODB_SERVER_SELECTION_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .min(100)
+    .max(120_000)
+    .default(10_000),
+  MONGODB_SOCKET_TIMEOUT_MS: z.coerce.number().int().min(0).max(300_000).default(30_000),
   SESSION_PEPPER: z.string().min(32).optional(),
   CSRF_SECRET: z.string().min(32).optional(),
   OTP_PEPPER: z.string().min(32).optional(),
@@ -58,29 +68,11 @@ const baseEnvironmentSchema = z.object({
 });
 
 const commonEnvironmentSchema = baseEnvironmentSchema.superRefine((env, context) => {
-  if (env.DATABASE_USER === env.DATABASE_OWNER_SCHEMA) {
+  if (env.MONGODB_MIN_POOL_SIZE > env.MONGODB_MAX_POOL_SIZE) {
     context.addIssue({
       code: 'custom',
-      path: ['DATABASE_USER'],
-      message: 'DATABASE_USER must be a separate least-privilege runtime account',
-    });
-  }
-
-  for (const key of ['DATABASE_USER', 'DATABASE_OWNER_SCHEMA'] as const) {
-    if (env[key] === 'SYS' || env[key] === 'SYSTEM') {
-      context.addIssue({
-        code: 'custom',
-        path: [key],
-        message: `${key} must not use an Oracle administrative account`,
-      });
-    }
-  }
-
-  if (env.DATABASE_POOL_MIN > env.DATABASE_POOL_MAX) {
-    context.addIssue({
-      code: 'custom',
-      path: ['DATABASE_POOL_MIN'],
-      message: 'DATABASE_POOL_MIN cannot exceed DATABASE_POOL_MAX',
+      path: ['MONGODB_MIN_POOL_SIZE'],
+      message: 'MONGODB_MIN_POOL_SIZE cannot exceed MONGODB_MAX_POOL_SIZE',
     });
   }
 
@@ -132,8 +124,15 @@ export const environmentSchema = commonEnvironmentSchema.superRefine((env, conte
   }
 
   if (env.NODE_ENV === 'production') {
+    if (isLocalMongoUri(env.MONGODB_URI)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['MONGODB_URI'],
+        message: 'MONGODB_URI must point to a non-local deployment in production',
+      });
+    }
+
     for (const key of [
-      'DATABASE_PASSWORD',
       'SESSION_PEPPER',
       'CSRF_SECRET',
       'OTP_PEPPER',
@@ -175,11 +174,11 @@ export const environmentSchema = commonEnvironmentSchema.superRefine((env, conte
 });
 
 export const workerEnvironmentSchema = commonEnvironmentSchema.superRefine((env, context) => {
-  if (env.NODE_ENV === 'production' && !env.DATABASE_PASSWORD) {
+  if (env.NODE_ENV === 'production' && isLocalMongoUri(env.MONGODB_URI)) {
     context.addIssue({
       code: 'custom',
-      path: ['DATABASE_PASSWORD'],
-      message: 'DATABASE_PASSWORD is required in production',
+      path: ['MONGODB_URI'],
+      message: 'MONGODB_URI must point to a non-local deployment in production',
     });
   }
 });

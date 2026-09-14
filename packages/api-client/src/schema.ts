@@ -352,7 +352,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** Oracle-backed readiness */
+    /** MongoDB-backed readiness */
     get: operations['HealthController_ready'];
     put?: never;
     post?: never;
@@ -945,10 +945,6 @@ export interface components {
       status: 'pending';
     };
     ReadyStatus: {
-      database: {
-        currentSchema: string;
-        databaseVersion: string;
-      };
       /** @enum {string} */
       status: 'ok';
     };
@@ -2203,7 +2199,7 @@ export interface operations {
     };
     requestBody?: never;
     responses: {
-      /** @description Oracle is ready. */
+      /** @description Service is ready. */
       200: {
         headers: {
           [name: string]: unknown;

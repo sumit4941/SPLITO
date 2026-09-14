@@ -1,20 +1,41 @@
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
-import oracledb, { type Connection } from 'oracledb';
 import { canonicalJsonHash } from '../common/canonical-json.js';
 import { ApiError } from '../common/api-error.js';
-import { readTextLob } from '../database/lob.js';
-import { OracleService } from '../database/oracle.service.js';
-import { rawToUuid, uuidToRaw } from '../database/uuid.js';
+import {
+  MongoService,
+  RetryableMongoTransactionError,
+  type MongoTransactionalUnitOfWork,
+} from '../database/mongo.service.js';
+import { isMongoDuplicateKey } from '../database/mongo.helpers.js';
 
-interface IdempotencyRow {
-  IDEMPOTENCY_KEY_ID: Buffer;
-  REQUEST_HASH: Buffer;
-  STATUS: 'IN_PROGRESS' | 'COMPLETED' | 'FAILED';
-  HTTP_STATUS: string | null;
-  RESPONSE_BODY_JSON: unknown;
-  RESOURCE_ID: Buffer | null;
-  EXPIRED_FLAG: 'Y' | 'N';
+interface IdempotencySlotDocument {
+  _id: string;
+  id: string;
+  actorParticipantId: string;
+  operationKey: string;
+  keyHash: string;
+  requestHash: string;
+  status: 'IN_PROGRESS' | 'COMPLETED';
+  httpStatus?: number;
+  responseBody?: unknown;
+  resourceId?: string;
+  createdAt: Date;
+  completedAt?: Date;
+  expiresAt: Date;
+}
+
+interface IdempotencyReceiptDocument {
+  _id: string;
+  scopeId: string;
+  actorParticipantId: string;
+  operationKey: string;
+  keyHash: string;
+  requestHash: string;
+  httpStatus: number;
+  resourceId?: string;
+  createdAt: Date;
+  completedAt: Date;
 }
 
 export interface IdempotencyClaim<T> {
@@ -22,29 +43,20 @@ export interface IdempotencyClaim<T> {
   readonly replay?: { readonly status: number; readonly body: T; readonly resourceId?: string };
 }
 
-function sha256(value: string): Buffer {
-  return createHash('sha256').update(value, 'utf8').digest();
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-function sameHash(left: Buffer, right: Buffer): boolean {
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === 'object' &&
-    error !== null &&
-    'errorNum' in error &&
-    Number(error.errorNum) === 1
-  );
+function identityFor(actorParticipantId: string, operation: string, keyHash: string): string {
+  return sha256(`${actorParticipantId}\u0000${operation}\u0000${keyHash}`);
 }
 
 @Injectable()
 export class IdempotencyService {
-  constructor(private readonly oracle: OracleService) {}
+  constructor(private readonly mongo: MongoService) {}
 
   async claim<T>(
-    connection: Connection,
+    work: MongoTransactionalUnitOfWork,
     values: {
       readonly actorParticipantId: string;
       readonly operation: string;
@@ -52,75 +64,61 @@ export class IdempotencyService {
       readonly requestBody: unknown;
     },
   ): Promise<IdempotencyClaim<T>> {
-    const id = randomUUID();
+    if (!work.session) throw new Error('Idempotency claims require a MongoDB transaction');
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1_000);
     const keyHash = sha256(values.key);
-    const requestHash = canonicalJsonHash(values.requestBody);
+    const bodyHash = canonicalJsonHash(values.requestBody).toString('hex');
+    const identity = identityFor(values.actorParticipantId, values.operation, keyHash);
+    const proposedId = randomUUID();
+    const collection = work.db.collection<IdempotencySlotDocument>('idempotencyKeys');
+    const options = { upsert: true, returnDocument: 'after' as const, session: work.session };
+
+    // A deterministic MongoDB _id makes this atomic without catching a
+    // duplicate-key error in the usual case. A concurrent first insert can
+    // still race, so that one narrowly scoped error restarts the whole
+    // transaction in a fresh session.
+    let row: IdempotencySlotDocument | null;
     try {
-      await this.oracle.execute(
-        connection,
-        `INSERT INTO SPLITO_IDEMPOTENCY_KEYS (
-           IDEMPOTENCY_KEY_ID, ACTOR_PARTICIPANT_ID, OPERATION_KEY,
-           KEY_HASH, REQUEST_HASH, EXPIRES_AT_UTC
-         ) VALUES (
-           :id, :actorId, :operation, :keyHash, :requestHash,
-           SYS_EXTRACT_UTC(SYSTIMESTAMP) + NUMTODSINTERVAL(24, 'HOUR')
-         )`,
+      row = await collection.findOneAndUpdate(
+        { _id: identity },
         {
-          id: uuidToRaw(id),
-          actorId: uuidToRaw(values.actorParticipantId),
-          operation: values.operation,
-          keyHash,
-          requestHash,
+          $setOnInsert: {
+            id: proposedId,
+            actorParticipantId: values.actorParticipantId,
+            operationKey: values.operation,
+            keyHash,
+            requestHash: bodyHash,
+            status: 'IN_PROGRESS',
+            createdAt: now,
+            expiresAt,
+          },
         },
+        options,
       );
-      return { id };
     } catch (error) {
-      if (!isUniqueViolation(error)) throw error;
+      if (isMongoDuplicateKey(error)) throw new RetryableMongoTransactionError(error);
+      throw error;
     }
+    if (!row) throw new Error('Idempotency claim was not persisted');
+    if (row.id === proposedId) return { id: proposedId };
 
-    const selected = await this.oracle.execute<IdempotencyRow>(
-      connection,
-      `SELECT IDEMPOTENCY_KEY_ID, REQUEST_HASH, STATUS,
-              TO_CHAR(HTTP_STATUS) AS HTTP_STATUS, RESPONSE_BODY_JSON, RESOURCE_ID,
-              CASE WHEN EXPIRES_AT_UTC <= SYS_EXTRACT_UTC(SYSTIMESTAMP) THEN 'Y' ELSE 'N' END AS EXPIRED_FLAG
-         FROM SPLITO_IDEMPOTENCY_KEYS
-        WHERE ACTOR_PARTICIPANT_ID = :actorId
-          AND OPERATION_KEY = :operation
-          AND KEY_HASH = :keyHash
-        FOR UPDATE`,
-      {
-        actorId: uuidToRaw(values.actorParticipantId),
-        operation: values.operation,
-        keyHash,
-      },
-    );
-    const row = selected.rows?.[0];
-    if (!row) throw new Error('Idempotency uniqueness conflict had no matching row');
-    const existingId = rawToUuid(row.IDEMPOTENCY_KEY_ID);
-
-    if (row.EXPIRED_FLAG === 'Y') {
-      await this.oracle.execute(
-        connection,
-        `UPDATE SPLITO_IDEMPOTENCY_KEYS
-            SET REQUEST_HASH = :requestHash,
-                STATUS = 'IN_PROGRESS', HTTP_STATUS = NULL, RESPONSE_BODY_JSON = NULL,
-                RESOURCE_ID = NULL, CREATED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP),
-                COMPLETED_AT_UTC = NULL,
-                EXPIRES_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP) + NUMTODSINTERVAL(24, 'HOUR')
-          WHERE IDEMPOTENCY_KEY_ID = :id`,
-        { requestHash, id: row.IDEMPOTENCY_KEY_ID },
+    if (row.expiresAt.getTime() <= now.getTime()) {
+      const reset = await collection.updateOne(
+        { _id: identity, id: row.id, expiresAt: { $lte: now } },
+        {
+          $set: {
+            id: proposedId,
+            requestHash: bodyHash,
+            status: 'IN_PROGRESS',
+            createdAt: now,
+            expiresAt,
+          },
+          $unset: { httpStatus: '', responseBody: '', resourceId: '', completedAt: '' },
+        },
+        { session: work.session },
       );
-      return { id: existingId };
-    }
-
-    if (!sameHash(row.REQUEST_HASH, requestHash)) {
-      throw new ApiError(
-        409,
-        'IDEMPOTENCY_KEY_REUSED',
-        'This idempotency key was already used with a different request payload.',
-      );
-    }
-    if (row.STATUS === 'IN_PROGRESS') {
+      if (reset.modifiedCount === 1) return { id: proposedId };
       throw new ApiError(
         409,
         'IDEMPOTENCY_REQUEST_IN_PROGRESS',
@@ -128,22 +126,39 @@ export class IdempotencyService {
       );
     }
 
-    const text = await readTextLob(row.RESPONSE_BODY_JSON);
-    if (!text || !row.HTTP_STATUS) {
+    if (row.requestHash !== bodyHash) {
+      throw new ApiError(
+        409,
+        'IDEMPOTENCY_KEY_REUSED',
+        'This idempotency key was already used with a different request payload.',
+      );
+    }
+    if (row.status === 'IN_PROGRESS') {
+      throw new ApiError(
+        409,
+        'IDEMPOTENCY_REQUEST_IN_PROGRESS',
+        'A request with this idempotency key is still in progress.',
+      );
+    }
+    if (
+      row.status !== 'COMPLETED' ||
+      row.httpStatus === undefined ||
+      row.responseBody === undefined
+    ) {
       throw new Error('Completed idempotency result is missing its stored outcome');
     }
     return {
-      id: existingId,
+      id: row.id,
       replay: {
-        status: Number(row.HTTP_STATUS),
-        body: JSON.parse(text) as T,
-        ...(row.RESOURCE_ID ? { resourceId: rawToUuid(row.RESOURCE_ID) } : {}),
+        status: row.httpStatus,
+        body: row.responseBody as T,
+        ...(row.resourceId ? { resourceId: row.resourceId } : {}),
       },
     };
   }
 
   async complete(
-    connection: Connection,
+    work: MongoTransactionalUnitOfWork,
     values: {
       readonly id: string;
       readonly httpStatus: number;
@@ -151,24 +166,43 @@ export class IdempotencyService {
       readonly resourceId?: string;
     },
   ): Promise<void> {
-    const result = await this.oracle.execute(
-      connection,
-      `UPDATE SPLITO_IDEMPOTENCY_KEYS
-          SET STATUS = 'COMPLETED', HTTP_STATUS = :httpStatus,
-              RESPONSE_BODY_JSON = :responseBody,
-              RESOURCE_ID = :resourceId,
-              COMPLETED_AT_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP)
-        WHERE IDEMPOTENCY_KEY_ID = :id
-          AND STATUS = 'IN_PROGRESS'`,
-      {
-        httpStatus: values.httpStatus,
-        responseBody: { val: JSON.stringify(values.responseBody), type: oracledb.CLOB },
-        resourceId: values.resourceId ? uuidToRaw(values.resourceId) : null,
-        id: uuidToRaw(values.id),
-      },
-    );
-    if (result.rowsAffected !== 1) {
+    if (!work.session) throw new Error('Idempotency completion requires a MongoDB transaction');
+    const completedAt = new Date();
+    const slot = await work.db
+      .collection<IdempotencySlotDocument>('idempotencyKeys')
+      .findOneAndUpdate(
+        { id: values.id, status: 'IN_PROGRESS' },
+        {
+          $set: {
+            status: 'COMPLETED',
+            httpStatus: values.httpStatus,
+            responseBody: values.responseBody,
+            completedAt,
+            ...(values.resourceId ? { resourceId: values.resourceId } : {}),
+          },
+        },
+        {
+          returnDocument: 'after',
+          session: work.session,
+        },
+      );
+    if (!slot) {
       throw new Error('Idempotency outcome was not persisted exactly once');
     }
+    await work.db.collection<IdempotencyReceiptDocument>('idempotencyReceipts').insertOne(
+      {
+        _id: slot.id,
+        scopeId: slot._id,
+        actorParticipantId: slot.actorParticipantId,
+        operationKey: slot.operationKey,
+        keyHash: slot.keyHash,
+        requestHash: slot.requestHash,
+        httpStatus: values.httpStatus,
+        ...(values.resourceId ? { resourceId: values.resourceId } : {}),
+        createdAt: slot.createdAt,
+        completedAt,
+      },
+      { session: work.session },
+    );
   }
 }

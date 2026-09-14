@@ -13,7 +13,9 @@
     "pretypecheck": "npm run build --workspace @splito/config && npm run build --workspace @splito/domain",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "test": "vitest run"
+    "test": "vitest run --config vitest.config.ts",
+    "pretest:integration": "npm run build --workspace @splito/config && npm run build --workspace @splito/domain",
+    "test:integration": "node --env-file-if-exists=../../.env ../../node_modules/vitest/vitest.mjs run --config src/vitest.mongodb.config.ts"
   },
   "dependencies": {
     "@fastify/cookie": "11.1.2",
@@ -30,7 +32,7 @@
     "@splito/domain": "0.1.0",
     "argon2": "0.45.1",
     "fastify": "5.12.1",
-    "oracledb": "7.0.1",
+    "mongodb": "7.6.0",
     "pino": "10.3.1",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",

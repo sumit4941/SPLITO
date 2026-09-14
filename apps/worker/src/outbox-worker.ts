@@ -1,55 +1,39 @@
 import { randomUUID } from 'node:crypto';
 import type { Environment } from '@splito/config';
-import oracledb, { type Connection, type Pool } from 'oracledb';
+import type { Db, MongoClient } from 'mongodb';
 import type { Logger } from 'pino';
 
 export interface ClaimedOutboxEvent {
-  id: Buffer;
+  id: string;
   idText: string;
   eventType: string;
   aggregateType: string;
-  aggregateId: Buffer;
+  aggregateId: string;
   payload: unknown;
   attempts: number;
 }
 
 export type OutboxHandler = (event: ClaimedOutboxEvent) => Promise<void>;
 
+interface OutboxDocument {
+  _id: string;
+  eventType: string;
+  aggregateType: string;
+  aggregateId: string;
+  payload: unknown;
+  status: 'PENDING' | 'LEASED' | 'RETRY' | 'PROCESSED' | 'DEAD';
+  attempts: number;
+  availableAt: Date;
+  leasedUntil?: Date;
+  leaseOwner?: string;
+  lastError?: string;
+  processedAt?: Date;
+  createdAt: Date;
+}
+
 interface LeaseHeartbeat {
   leaseWasLost(): boolean;
   stop(): Promise<void>;
-}
-
-function rawUuidToString(value: Buffer): string {
-  const hex = value.toString('hex');
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    hex.slice(12, 16),
-    hex.slice(16, 20),
-    hex.slice(20),
-  ].join('-');
-}
-
-function uuidToRaw(value: string): Buffer {
-  return Buffer.from(value.replaceAll('-', ''), 'hex');
-}
-
-async function readLob(value: unknown): Promise<string> {
-  if (typeof value === 'string') return value;
-  if (Buffer.isBuffer(value)) return value.toString('utf8');
-  if (!value || typeof value !== 'object' || !('getData' in value)) {
-    throw new Error('Unsupported Oracle representation for an outbox JSON payload');
-  }
-  return (value as { getData(): Promise<string> }).getData();
-}
-
-function parseAttemptCount(value: string | number): number {
-  const attempts = typeof value === 'number' ? value : Number(value);
-  if (!Number.isSafeInteger(attempts) || attempts < 0) {
-    throw new Error('Oracle returned an invalid outbox attempt count');
-  }
-  return attempts;
 }
 
 export class OutboxWorker {
@@ -62,7 +46,8 @@ export class OutboxWorker {
   #stopping = false;
 
   constructor(
-    private readonly pool: Pool,
+    private readonly client: MongoClient,
+    private readonly database: Db,
     private readonly config: Environment,
     private readonly logger: Logger,
   ) {}
@@ -89,12 +74,10 @@ export class OutboxWorker {
     if (!Number.isInteger(maximumEvents) || maximumEvents < 1 || maximumEvents > 100) {
       throw new Error('maximumEvents must be an integer between 1 and 100');
     }
-
+    await this.#deadLetterExhaustedEvents();
     let processed = 0;
     while (!this.#stopping && processed < maximumEvents) {
-      // Claim immediately before dispatch. Leasing a large batch and processing it
-      // serially can let later leases expire before their handlers even start.
-      const [event] = await this.#claim(1);
+      const event = await this.#claim();
       if (!event) break;
       await this.#dispatch(event);
       processed += 1;
@@ -106,7 +89,7 @@ export class OutboxWorker {
     this.#stopping = true;
     this.#wakePoll?.();
     if (this.#loopPromise) await this.#loopPromise;
-    await this.pool.close(10);
+    await this.client.close();
     this.logger.info({ workerId: this.#workerId }, 'outbox worker stopped');
   }
 
@@ -117,9 +100,7 @@ export class OutboxWorker {
       } catch (error) {
         this.logger.error({ err: error }, 'outbox polling failed');
       }
-      if (!this.#stopping) {
-        await this.#waitForNextPoll();
-      }
+      if (!this.#stopping) await this.#waitForNextPoll();
     }
   }
 
@@ -135,86 +116,64 @@ export class OutboxWorker {
         resolve();
       };
       this.#wakePoll = complete;
-      // Keep this timer referenced: it is the worker daemon's scheduler.
       this.#timer = setTimeout(complete, this.config.OUTBOX_POLL_MS);
     });
   }
 
-  async #claim(limit: number): Promise<ClaimedOutboxEvent[]> {
-    let connection: Connection | undefined;
-    try {
-      connection = await this.pool.getConnection();
-      connection.callTimeout = this.config.DATABASE_CALL_TIMEOUT_MS;
-      await connection.execute(
-        `ALTER SESSION SET CURRENT_SCHEMA = ${this.config.DATABASE_OWNER_SCHEMA}`,
-      );
-      const result = await connection.execute<{
-        OUTBOX_ID: Buffer;
-        EVENT_TYPE: string;
-        AGGREGATE_TYPE: string;
-        AGGREGATE_ID: Buffer;
-        PAYLOAD_JSON: unknown;
-        ATTEMPTS: string | number;
-      }>(
-        `SELECT OUTBOX_ID, EVENT_TYPE, AGGREGATE_TYPE, AGGREGATE_ID, PAYLOAD_JSON, ATTEMPTS
-           FROM SPLITO_OUTBOX
-          WHERE (
-                  (STATUS IN ('PENDING', 'RETRY')
-                   AND AVAILABLE_AT_UTC <= SYS_EXTRACT_UTC(SYSTIMESTAMP)
-                   AND (LEASED_UNTIL_UTC IS NULL OR LEASED_UNTIL_UTC < SYS_EXTRACT_UTC(SYSTIMESTAMP)))
-               OR (STATUS = 'LEASED'
-                   AND LEASED_UNTIL_UTC < SYS_EXTRACT_UTC(SYSTIMESTAMP))
-                )
-          ORDER BY CREATED_AT_UTC, OUTBOX_ID
-          FOR UPDATE SKIP LOCKED`,
-        {},
-        {
-          outFormat: oracledb.OUT_FORMAT_OBJECT,
-          // Oracle rejects a row-limiting clause combined with FOR UPDATE
-          // (ORA-02014). Bound both driver limits so only the requested base
-          // table rows are fetched and locked by this transaction. Prefetch
-          // must be disabled or execute() can lock rows beyond maxRows.
-          maxRows: limit,
-          fetchArraySize: limit,
-          prefetchRows: 0,
-        },
-      );
-
-      const claimed: ClaimedOutboxEvent[] = [];
-      for (const row of result.rows ?? []) {
-        await connection.execute(
-          `UPDATE SPLITO_OUTBOX
-              SET STATUS = 'LEASED',
-                  LEASE_OWNER = :workerId,
-                  LEASED_UNTIL_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP) + NUMTODSINTERVAL(:leaseSeconds, 'SECOND'),
-                  ATTEMPTS = ATTEMPTS + 1
-            WHERE OUTBOX_ID = :outboxId`,
+  async #claim(): Promise<ClaimedOutboxEvent | undefined> {
+    const now = new Date();
+    const leasedUntil = new Date(now.getTime() + this.config.OUTBOX_LEASE_SECONDS * 1_000);
+    const row = await this.database.collection<OutboxDocument>('outbox').findOneAndUpdate(
+      {
+        attempts: { $lt: this.config.OUTBOX_MAX_ATTEMPTS },
+        $or: [
           {
-            workerId: this.#workerId,
-            leaseSeconds: this.config.OUTBOX_LEASE_SECONDS,
-            outboxId: row.OUTBOX_ID,
+            status: { $in: ['PENDING', 'RETRY'] },
+            availableAt: { $lte: now },
+            $or: [{ leasedUntil: { $exists: false } }, { leasedUntil: { $lt: now } }],
           },
-        );
-        const payloadText = await readLob(row.PAYLOAD_JSON);
-        const previousAttempts = parseAttemptCount(row.ATTEMPTS);
-        claimed.push({
-          id: row.OUTBOX_ID,
-          idText: rawUuidToString(row.OUTBOX_ID),
-          eventType: row.EVENT_TYPE,
-          aggregateType: row.AGGREGATE_TYPE,
-          aggregateId: row.AGGREGATE_ID,
-          payload: JSON.parse(payloadText) as unknown,
-          attempts: previousAttempts + 1,
-        });
-      }
-      await connection.commit();
-      return claimed;
-    } catch (error) {
-      if (connection) await connection.rollback();
-      throw error;
-    } finally {
-      if (connection) await connection.close();
+          { status: 'LEASED', leasedUntil: { $lt: now } },
+        ],
+      },
+      {
+        $set: { status: 'LEASED', leaseOwner: this.#workerId, leasedUntil },
+        $inc: { attempts: 1 },
+      },
+      { sort: { createdAt: 1, _id: 1 }, returnDocument: 'after' },
+    );
+    if (!row) return undefined;
+    if (!Number.isSafeInteger(row.attempts) || row.attempts < 1) {
+      throw new Error('MongoDB returned an invalid outbox attempt count');
     }
+    return {
+      id: row._id,
+      idText: row._id,
+      eventType: row.eventType,
+      aggregateType: row.aggregateType,
+      aggregateId: row.aggregateId,
+      payload: row.payload,
+      attempts: row.attempts,
+    };
+  }
+
+  async #deadLetterExhaustedEvents(): Promise<void> {
+    const now = new Date();
+    await this.database.collection<OutboxDocument>('outbox').updateMany(
+      {
+        attempts: { $gte: this.config.OUTBOX_MAX_ATTEMPTS },
+        $or: [
+          { status: { $in: ['PENDING', 'RETRY'] }, availableAt: { $lte: now } },
+          { status: 'LEASED', leasedUntil: { $lt: now } },
+        ],
+      },
+      {
+        $set: {
+          status: 'DEAD',
+          lastError: 'Maximum delivery attempts were exhausted before processing completed',
+        },
+        $unset: { leasedUntil: '', leaseOwner: '', processedAt: '' },
+      },
+    );
   }
 
   async #dispatch(event: ClaimedOutboxEvent): Promise<void> {
@@ -230,7 +189,6 @@ export class OutboxWorker {
       dispatchError = error;
     }
     await heartbeat.stop();
-
     if (heartbeat.leaseWasLost()) {
       this.logger.error(
         { outboxId: event.idText, eventType: event.eventType },
@@ -238,7 +196,6 @@ export class OutboxWorker {
       );
       return;
     }
-
     if (failed) {
       const dead = event.attempts >= this.config.OUTBOX_MAX_ATTEMPTS;
       await this.#finish(event, dead ? 'DEAD' : 'RETRY', dispatchError);
@@ -253,7 +210,6 @@ export class OutboxWorker {
       );
       return;
     }
-
     await this.#finish(event, 'PROCESSED');
     this.logger.info(
       { outboxId: event.idText, eventType: event.eventType },
@@ -270,7 +226,6 @@ export class OutboxWorker {
     let lost = false;
     let timer: NodeJS.Timeout | undefined;
     let pendingRenewal: Promise<void> | undefined;
-
     const schedule = (): void => {
       if (stopped || lost) return;
       timer = setTimeout(() => {
@@ -298,7 +253,6 @@ export class OutboxWorker {
           });
       }, intervalMilliseconds);
     };
-
     schedule();
     return {
       leaseWasLost: () => lost,
@@ -311,31 +265,17 @@ export class OutboxWorker {
   }
 
   async #renewLease(event: ClaimedOutboxEvent): Promise<boolean> {
-    let connection: Connection | undefined;
-    try {
-      connection = await this.pool.getConnection();
-      connection.callTimeout = this.config.DATABASE_CALL_TIMEOUT_MS;
-      await connection.execute(
-        `ALTER SESSION SET CURRENT_SCHEMA = ${this.config.DATABASE_OWNER_SCHEMA}`,
-      );
-      const result = await connection.execute(
-        `UPDATE SPLITO_OUTBOX
-            SET LEASED_UNTIL_UTC = SYS_EXTRACT_UTC(SYSTIMESTAMP) + NUMTODSINTERVAL(:leaseSeconds, 'SECOND')
-          WHERE OUTBOX_ID = :outboxId
-            AND STATUS = 'LEASED'
-            AND LEASE_OWNER = :workerId
-            AND LEASED_UNTIL_UTC >= SYS_EXTRACT_UTC(SYSTIMESTAMP)`,
-        {
-          leaseSeconds: this.config.OUTBOX_LEASE_SECONDS,
-          outboxId: event.id,
-          workerId: this.#workerId,
-        },
-        { autoCommit: true },
-      );
-      return result.rowsAffected === 1;
-    } finally {
-      if (connection) await connection.close();
-    }
+    const now = new Date();
+    const result = await this.database.collection<OutboxDocument>('outbox').updateOne(
+      {
+        _id: event.id,
+        status: 'LEASED',
+        leaseOwner: this.#workerId,
+        leasedUntil: { $gte: now },
+      },
+      { $set: { leasedUntil: new Date(now.getTime() + this.config.OUTBOX_LEASE_SECONDS * 1_000) } },
+    );
+    return result.modifiedCount === 1;
   }
 
   async #finish(
@@ -343,42 +283,29 @@ export class OutboxWorker {
     status: 'PROCESSED' | 'RETRY' | 'DEAD',
     error?: unknown,
   ): Promise<void> {
-    let connection: Connection | undefined;
-    try {
-      connection = await this.pool.getConnection();
-      connection.callTimeout = this.config.DATABASE_CALL_TIMEOUT_MS;
-      await connection.execute(
-        `ALTER SESSION SET CURRENT_SCHEMA = ${this.config.DATABASE_OWNER_SCHEMA}`,
-      );
-      const message = error instanceof Error ? error.message.slice(0, 2_000) : null;
-      const result = await connection.execute(
-        `UPDATE SPLITO_OUTBOX
-            SET STATUS = :status,
-                PROCESSED_AT_UTC = CASE WHEN :status = 'PROCESSED' THEN SYS_EXTRACT_UTC(SYSTIMESTAMP) ELSE NULL END,
-                AVAILABLE_AT_UTC = CASE
-                  WHEN :status = 'RETRY'
-                  THEN SYS_EXTRACT_UTC(SYSTIMESTAMP) + NUMTODSINTERVAL(LEAST(POWER(2, ATTEMPTS), 300), 'SECOND')
-                  ELSE AVAILABLE_AT_UTC
-                END,
-                LEASED_UNTIL_UTC = NULL,
-                LEASE_OWNER = NULL,
-                LAST_ERROR = :lastError
-          WHERE OUTBOX_ID = :outboxId
-            AND STATUS = 'LEASED'
-            AND LEASE_OWNER = :workerId`,
-        {
+    const now = new Date();
+    const lastError = error instanceof Error ? error.message.slice(0, 2_000) : undefined;
+    const result = await this.database.collection<OutboxDocument>('outbox').updateOne(
+      { _id: event.id, status: 'LEASED', leaseOwner: this.#workerId },
+      {
+        $set: {
           status,
-          lastError: message,
-          outboxId: event.id,
-          workerId: this.#workerId,
+          ...(status === 'PROCESSED' ? { processedAt: now } : {}),
+          ...(status === 'RETRY'
+            ? { availableAt: new Date(now.getTime() + Math.min(2 ** event.attempts, 300) * 1_000) }
+            : {}),
+          ...(lastError ? { lastError } : {}),
         },
-        { autoCommit: true },
-      );
-      if (result.rowsAffected !== 1) {
-        throw new Error(`Outbox lease was lost before ${status.toLowerCase()} could be recorded`);
-      }
-    } finally {
-      if (connection) await connection.close();
+        $unset: {
+          leasedUntil: '',
+          leaseOwner: '',
+          ...(status !== 'PROCESSED' ? { processedAt: '' } : {}),
+          ...(lastError ? {} : { lastError: '' }),
+        },
+      },
+    );
+    if (result.modifiedCount !== 1) {
+      throw new Error(`Outbox lease was lost before ${status.toLowerCase()} could be recorded`);
     }
   }
 }
@@ -389,18 +316,15 @@ export function createDevelopmentHandler(config: Environment, logger: Logger): O
       'No production outbox delivery handlers are configured; refusing to use the development log sink',
     );
   }
-
   return (event) => {
     logger.info(
       {
         eventType: event.eventType,
         aggregateType: event.aggregateType,
-        aggregateId: event.aggregateId ? rawUuidToString(event.aggregateId) : undefined,
+        aggregateId: event.aggregateId,
       },
       'development event sink (no external delivery configured)',
     );
     return Promise.resolve();
   };
 }
-
-export { uuidToRaw };
