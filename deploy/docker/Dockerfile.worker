@@ -1,4 +1,4 @@
-FROM node:24.21.0-bookworm-slim AS build
+FROM node:26.8-bookworm-slim AS build
 WORKDIR /workspace
 ENV NODE_ENV=development
 COPY package.json package-lock.json ./
@@ -15,7 +15,7 @@ RUN npm run build --workspace @splito/config \
  && npm run build --workspace @splito/worker \
  && npm prune --omit=dev
 
-FROM node:24.21.0-bookworm-slim AS runtime
+FROM node:26.8-bookworm-slim AS runtime
 WORKDIR /workspace
 ENV NODE_ENV=production
 COPY --from=build --chown=node:node /workspace/package.json /workspace/package-lock.json ./
