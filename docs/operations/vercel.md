@@ -44,7 +44,7 @@ keeps the rewrite destination present while marking `SPLITO_API_ORIGIN` for
 deployment-time substitution; do not replace it with an early `process.env`
 lookup in the route object.
 
-Set this non-secret environment variable for each enabled Vercel environment:
+Set exactly this non-secret environment variable for each enabled Vercel environment:
 
 ```text
 SPLITO_API_ORIGIN=https://api.example.com
@@ -52,22 +52,44 @@ SPLITO_API_ORIGIN=https://api.example.com
 
 It must be a canonical HTTPS origin only: no trailing slash, `/api`, `/api/v1`,
 credentials, query, or fragment. The build fails closed when it is absent or
-malformed. Do not set `VITE_API_BASE_URL`; `/api/v1` must remain a same-origin
-browser path.
+malformed. It must not point back to this Vercel project, which would create an
+API rewrite loop. Do not set `VITE_API_BASE_URL`; `/api/v1` must remain a
+same-origin browser path.
+
+Do not add `MONGODB_*`, session/CSRF/OTP/MFA secrets, cookie configuration,
+Twilio credentials, storage configuration, or worker configuration to the
+Vercel web project. The build rejects these backend-only variables so they
+cannot be accidentally exposed to the wrong deployment boundary. Browser source
+maps may be opted into with `SPLITO_WEB_SOURCEMAPS=true`; leave it unset unless a
+reviewed monitoring pipeline requires them.
 
 The API environment corresponding to the production web deployment must use:
 
 ```text
 NODE_ENV=production
+API_HOST=0.0.0.0
+# API_PORT=3000, or rely on the host-provided PORT variable
 WEB_ORIGIN=https://app.example.com
 COOKIE_SECURE=true
+MONGODB_URI=mongodb+srv://<api-user>:<percent-encoded-password>@<cluster-host>/?retryWrites=true&w=majority&appName=Splito
+MONGODB_DATABASE=splito
+SESSION_PEPPER=<independent-random-secret-at-least-32-characters>
+CSRF_SECRET=<independent-random-secret-at-least-32-characters>
+OTP_PEPPER=<independent-random-secret-at-least-32-characters>
+MFA_ENCRYPTION_KEY=<32-random-bytes-as-64-hex-characters>
+SMS_PROVIDER=twilio
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_API_KEY_SID=SK...
+TWILIO_API_KEY_SECRET=<secret>
+# Configure exactly one sender:
+TWILIO_FROM_E164=+...
+# TWILIO_MESSAGING_SERVICE_SID=MG...
 ```
 
 Leave `COOKIE_DOMAIN` unset. Supply the independent session, CSRF, OTP, and MFA
-secrets, a least-privilege `MONGODB_URI`, and complete Twilio API-key plus
-exactly one sender configuration through the backend platform's secret manager.
-Set `TRUST_PROXY=true` only if that service can receive traffic solely through a
-trusted proxy that overwrites forwarding headers.
+secrets and connection/provider values through the backend platform's secret
+manager. Set `TRUST_PROXY=true` only if that service can receive traffic solely
+through a trusted proxy that overwrites forwarding headers.
 
 Invitation links are generated from `WEB_ORIGIN`, so change it to the final
 custom domain before the release smoke test. When database ingress uses an IP

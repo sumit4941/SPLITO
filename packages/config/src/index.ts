@@ -186,7 +186,11 @@ export const workerEnvironmentSchema = commonEnvironmentSchema.superRefine((env,
 export type Environment = z.infer<typeof environmentSchema>;
 
 export function loadEnvironment(source: NodeJS.ProcessEnv = process.env): Environment {
-  return parseEnvironment(environmentSchema, source);
+  const apiPort = source.API_PORT?.trim();
+  const platformPort = source.PORT?.trim();
+  const normalizedSource =
+    !apiPort && platformPort ? { ...source, API_PORT: platformPort } : source;
+  return parseEnvironment(environmentSchema, normalizedSource);
 }
 
 export function loadWorkerEnvironment(source: NodeJS.ProcessEnv = process.env): Environment {

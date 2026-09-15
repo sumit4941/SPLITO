@@ -88,8 +88,8 @@ export async function assertMongoRuntimeReady(
     component === 'worker' ? [COLLECTIONS.outbox] : Object.values(COLLECTIONS);
   const collectionRows = await database
     .listCollections(
-      { name: { $in: requiredCollections } },
-      { nameOnly: !verifyManagedSchema, authorizedCollections: true },
+      {},
+      verifyManagedSchema ? { nameOnly: false } : { nameOnly: true, authorizedCollections: true },
     )
     .toArray();
   const installedCollections = new Set(collectionRows.map(({ name }) => name));

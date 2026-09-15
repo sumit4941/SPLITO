@@ -21,7 +21,6 @@ storage/private/
 storage/*
 !storage/.gitkeep
 tmp/
-database/.migration-lock
 docs/generated/
 .DS_Store
 Thumbs.db

@@ -12,6 +12,11 @@ describe('runtime configuration', () => {
     expect(config.MONGODB_MIN_POOL_SIZE).toBeLessThanOrEqual(config.MONGODB_MAX_POOL_SIZE);
   });
 
+  it('uses the standard platform port only when API_PORT is absent', () => {
+    expect(loadEnvironment({ PORT: '8080' }).API_PORT).toBe(8080);
+    expect(loadEnvironment({ PORT: '8080', API_PORT: '3001' }).API_PORT).toBe(3001);
+  });
+
   it('rejects an inverted connection pool', () => {
     expect(() =>
       loadEnvironment({ MONGODB_MIN_POOL_SIZE: '9', MONGODB_MAX_POOL_SIZE: '2' }),
