@@ -1,3 +1,5 @@
+import { isIP } from 'node:net';
+
 const configuredApiOrigin = process.env.SPLITO_API_ORIGIN;
 const apiOrigin = configuredApiOrigin?.trim();
 
@@ -36,6 +38,24 @@ function fail(message) {
   process.exitCode = 1;
 }
 
+function isNonPublicHostname(hostname) {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/gu, '');
+  if (
+    normalized.endsWith('.') ||
+    !normalized.includes('.') ||
+    normalized === 'localhost' ||
+    normalized.endsWith('.localhost') ||
+    normalized.endsWith('.local') ||
+    normalized.endsWith('.internal')
+  ) {
+    return true;
+  }
+
+  // Require a DNS name. Literal IP origins are brittle on managed hosting and
+  // make comprehensive private/reserved-address validation easy to bypass.
+  return isIP(normalized) !== 0;
+}
+
 const misplacedVariables = backendOnlyVariables.filter((name) => Object.hasOwn(process.env, name));
 if (misplacedVariables.length > 0) {
   fail(
@@ -64,8 +84,13 @@ if (!apiOrigin) {
       parsed.password === '';
 
     if (!isOriginOnly) throw new Error('invalid origin');
+    if (isNonPublicHostname(parsed.hostname)) throw new Error('non-public origin');
 
-    const vercelHosts = [process.env.VERCEL_URL, process.env.VERCEL_PROJECT_PRODUCTION_URL]
+    const vercelHosts = [
+      process.env.VERCEL_URL,
+      process.env.VERCEL_BRANCH_URL,
+      process.env.VERCEL_PROJECT_PRODUCTION_URL,
+    ]
       .map((host) => host?.trim().toLowerCase())
       .filter(Boolean);
     if (vercelHosts.includes(parsed.host.toLowerCase())) {
@@ -75,6 +100,8 @@ if (!apiOrigin) {
   } catch (error) {
     if (error instanceof Error && error.message === 'recursive origin') {
       fail('SPLITO_API_ORIGIN must not point back to this Vercel web project.');
+    } else if (error instanceof Error && error.message === 'non-public origin') {
+      fail('SPLITO_API_ORIGIN must use a publicly reachable hostname.');
     } else {
       fail(
         'SPLITO_API_ORIGIN must be a canonical HTTPS origin without credentials, a trailing slash, a path, a query, or a fragment.',

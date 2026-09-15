@@ -2,7 +2,13 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { validateStaticFields } from '@vercel/config/v1';
-import { config } from '../vercel.ts';
+
+const testApiOrigin = 'https://api.example.com';
+const previousApiOrigin = process.env.SPLITO_API_ORIGIN;
+process.env.SPLITO_API_ORIGIN = testApiOrigin;
+const { config } = await import('../vercel.ts');
+if (previousApiOrigin === undefined) delete process.env.SPLITO_API_ORIGIN;
+else process.env.SPLITO_API_ORIGIN = previousApiOrigin;
 
 function invariant(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(`Invalid Vercel configuration: ${message}`);
@@ -17,12 +23,12 @@ const [apiRewrite, spaFallback] = rewrites;
 invariant(apiRewrite, 'API rewrite is missing');
 invariant(apiRewrite.source === '/api/:path*', 'API rewrite source changed unexpectedly');
 invariant(
-  apiRewrite.destination === '$SPLITO_API_ORIGIN/api/:path*',
-  'API rewrite destination must use the deployment environment placeholder',
+  apiRewrite.destination === `${testApiOrigin}/api/:path*`,
+  'API rewrite destination must contain the validated build-time origin',
 );
 invariant(
-  apiRewrite.env?.includes('SPLITO_API_ORIGIN'),
-  'API rewrite must declare SPLITO_API_ORIGIN for deployment substitution',
+  apiRewrite.env === undefined,
+  'API rewrite must not defer origin substitution to the routing layer',
 );
 
 invariant(spaFallback, 'SPA fallback is missing');
@@ -77,6 +83,13 @@ const originCases = [
   ['path normalized by URL', 'https://api.example.com/.', false],
   ['empty query marker', 'https://api.example.com?', false],
   ['empty fragment marker', 'https://api.example.com#', false],
+  ['localhost', 'https://localhost:3000', false],
+  ['localhost with a trailing dot', 'https://localhost.:3000', false],
+  ['single-label hostname', 'https://api', false],
+  ['loopback address', 'https://127.0.0.1:3000', false],
+  ['public literal address', 'https://8.8.8.8', false],
+  ['private address', 'https://192.168.1.10:3000', false],
+  ['IPv4-mapped private IPv6 address', 'https://[::ffff:127.0.0.1]:3000', false],
 ] as const;
 
 for (const [name, origin, shouldPass] of originCases) {
@@ -99,6 +112,7 @@ const isolationCases = [
   ['MongoDB URI in web project', { MONGODB_URI: 'mongodb+srv://example.invalid/' }],
   ['browser API override', { VITE_API_BASE_URL: 'https://api.example.com/api/v1' }],
   ['recursive production origin', { VERCEL_PROJECT_PRODUCTION_URL: 'api.example.com' }],
+  ['recursive branch origin', { VERCEL_BRANCH_URL: 'api.example.com' }],
 ] as const;
 
 for (const [name, injected] of isolationCases) {

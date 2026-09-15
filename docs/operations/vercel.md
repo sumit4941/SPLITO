@@ -39,10 +39,11 @@ runs `npm ci`, builds only `@splito/web`, publishes `apps/web/dist`, proxies API
 traffic before the SPA fallback, and applies the web security/cache headers.
 The root Node engine pins the build to Node 24.
 
-`vercel.ts` uses Vercel's `deploymentEnv()` and `routes.rewrite()` helpers. This
-keeps the rewrite destination present while marking `SPLITO_API_ORIGIN` for
-deployment-time substitution; do not replace it with an early `process.env`
-lookup in the route object.
+`vercel.ts` validates `SPLITO_API_ORIGIN` during the build and bakes that
+non-secret HTTPS origin into the rewrite destination. This deliberately avoids
+request-time environment substitution in the routing layer: a missing value
+must fail the deployment instead of publishing an `/api` route with an empty
+hostname.
 
 Set exactly this non-secret environment variable for each enabled Vercel environment:
 
@@ -52,9 +53,10 @@ SPLITO_API_ORIGIN=https://api.example.com
 
 It must be a canonical HTTPS origin only: no trailing slash, `/api`, `/api/v1`,
 credentials, query, or fragment. The build fails closed when it is absent or
-malformed. It must not point back to this Vercel project, which would create an
-API rewrite loop. Do not set `VITE_API_BASE_URL`; `/api/v1` must remain a
-same-origin browser path.
+malformed, and requires a public DNS hostname rather than localhost, an internal
+hostname, or a literal IP address. It must not point back to this Vercel project,
+which would create an API rewrite loop. Do not set `VITE_API_BASE_URL`; `/api/v1`
+must remain a same-origin browser path.
 
 Do not add `MONGODB_*`, session/CSRF/OTP/MFA secrets, cookie configuration,
 Twilio credentials, storage configuration, or worker configuration to the

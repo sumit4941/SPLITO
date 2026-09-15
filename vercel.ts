@@ -1,6 +1,9 @@
-import { deploymentEnv, routes, type VercelConfig } from '@vercel/config/v1';
+import { routes, type VercelConfig } from '@vercel/config/v1';
 
-const apiOrigin = deploymentEnv('SPLITO_API_ORIGIN');
+const apiOrigin = process.env.SPLITO_API_ORIGIN?.trim();
+if (!apiOrigin) {
+  throw new Error('SPLITO_API_ORIGIN is required to compile the Vercel API rewrite.');
+}
 
 export const config: VercelConfig = {
   framework: 'vite',
